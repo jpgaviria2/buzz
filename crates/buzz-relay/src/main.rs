@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -1100,7 +1101,7 @@ async fn run_periodic_until_cancelled<Tick, TickFuture>(
 /// ┌─────────────────────────────────────────────────────────┐
 /// │  Listener 1: TCP BUZZ_BIND_ADDR:3000  (app router)   │
 /// │  Listener 2: UDS BUZZ_UDS_PATH        (app, optional)│
-/// │  Listener 3: TCP 0.0.0.0:8080           (health only)  │
+/// │  Listener 3: TCP BUZZ_BIND_ADDR IP:8080 (health only) │
 /// │  Listener 4: TCP 0.0.0.0:9102           (metrics, via  │
 /// │              PrometheusBuilder — already bound)         │
 /// │                                                         │
@@ -1115,10 +1116,11 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let config = &state.config;
 
-    let health_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.health_port))
+    let health_addr = SocketAddr::new(config.bind_addr.ip(), config.health_port);
+    let health_listener = tokio::net::TcpListener::bind(health_addr)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
-    info!(port = config.health_port, "Health probe listener started");
+        .map_err(|e| anyhow::anyhow!("Failed to bind health port {health_addr}: {e}"))?;
+    info!(addr = %health_addr, "Health probe listener started");
     tokio::spawn(async move {
         axum::serve(health_listener, health_router).await.ok();
     });
