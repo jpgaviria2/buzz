@@ -65,7 +65,7 @@ const FANOUT_BUCKETS: [f64; 9] = [0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0,
 /// Panics if a recorder is already installed or the port is in use.
 pub fn install(port: u16, gauge_idle_timeout_secs: u64) {
     let (recorder, exporter) = PrometheusBuilder::new()
-        .with_http_listener(([0, 0, 0, 0], port))
+        .with_http_listener(([127, 0, 0, 1], port))
         // Remove gauge series that the relay intentionally stops emitting.
         .idle_timeout(
             MetricKindMask::GAUGE,
