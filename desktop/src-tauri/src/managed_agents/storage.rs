@@ -19,11 +19,8 @@ fn agent_keyring_name(pubkey: &str) -> String {
     format!("agent:{pubkey}")
 }
 
-/// The agent secret store. `None` when the build has no keyring backend, in
-/// which case agent keys stay inline in the `0o600` JSON file. Uses
-/// `SecretStore::shared` so identity and agent callers share one instance —
-/// and therefore one in-memory cache and one mutex — preventing last-writer-wins
-/// races on concurrent blob writes.
+/// The agent secret store. `None` means keys stay inline in the `0o600` JSON.
+/// Identity and agent callers share one cache/mutex to avoid blob write races.
 fn agent_secret_store() -> Option<&'static SecretStore> {
     if cfg!(feature = "system-keyring") {
         Some(SecretStore::shared(keyring_service()))
@@ -229,16 +226,8 @@ pub(crate) fn backup_invalid_store(path: &Path) {
     }
 }
 
-/// Fill in each record's in-memory `private_key_nsec` from the keyring, and
-/// opportunistically re-migrate any key that is still inline.
-///
-/// - Empty key → fetch it from the keyring (the normal keyring-backed case).
-/// - Non-empty key → the JSON carried it inline because the keyring was
-///   unreachable at its last save. Re-migrate it now ([`migrate_inline_key`]):
-///   if the keyring is reachable this boot, write-verify-strip so the next save
-///   writes clean JSON and plaintext stops lingering on disk; if still
-///   unreachable, leave it inline. This makes the strip deterministic on the
-///   next reachable boot rather than waiting for a non-deterministic save.
+/// Fill each record's in-memory key from the keyring and opportunistically
+/// re-migrate inline fallback keys left by an earlier keyring outage.
 fn hydrate_keys(records: &mut [ManagedAgentRecord]) {
     let Some(store) = agent_secret_store() else {
         return;
@@ -337,8 +326,6 @@ pub(crate) fn save_agent_definitions(
 }
 
 /// Serialize definitions + instances into the single unified store file.
-/// Definitions sort first (by slug) for stable diffs; instances keep the
-/// name/pubkey order their save path established.
 fn write_agent_store(
     app: &AppHandle,
     mut definitions: Vec<ManagedAgentRecord>,
@@ -352,10 +339,7 @@ fn write_agent_store(
     let payload = serde_json::to_vec_pretty(&all)
         .map_err(|error| format!("failed to serialize agent store: {error}"))?;
 
-    // `managed-agents.json` carries plaintext agent nsecs in the keyringless
-    // fallback. Write it owner-only (`0o600`) unconditionally — harmless for the
-    // keyring-backed case (it is the user's own agent store) and closes the
-    // umask window a post-write `chmod` would leave open.
+    // The keyringless fallback carries plaintext nsecs, so always write 0o600.
     atomic_write_json_restricted(&path, &payload)
 }
 
@@ -377,11 +361,7 @@ fn persist_agent_keys(records: &mut [ManagedAgentRecord]) {
 /// Testable core of [`persist_agent_keys`], generic over the [`KeyStore`] seam.
 fn persist_agent_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) {
     for record in records.iter_mut() {
-        // Only a verified keyring entry lets us drop the inline copy. Both
-        // other outcomes keep the key inline: `KeptInline` (keyring
-        // unreachable) so it is not lost, and `Nothing` (empty key) because
-        // there is no verified entry to claim. This is a save-local clone, so
-        // callers keep their keys regardless.
+        // Only a verified keyring entry lets us drop the inline copy.
         if migrate_inline_key(store, record) == KeyMigration::Persisted {
             record.private_key_nsec.clear();
         }
