@@ -498,34 +498,6 @@ pub fn run() {
                 None => true,
             };
 
-            if restore_agents && !recovery_mode {
-                state
-                    .managed_agent_restore_pending
-                    .store(false, Ordering::Release);
-                if let Ok(relay_url) = std::env::var("BUZZ_RELAY_URL") {
-                    let relay_url = relay_url.trim().to_string();
-                    if !relay_url.is_empty() {
-                        if let Ok(mut override_guard) = state.relay_url_override.lock() {
-                            *override_guard = Some(relay_url.clone());
-                        }
-                    }
-                }
-                let restore_handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = restore_handle.state::<AppState>();
-                    if let Err(error) = managed_agents::restore_managed_agents_on_launch(
-                        &restore_handle,
-                        &state.shutdown_started,
-                    )
-                    .await
-                    {
-                        eprintln!(
-                            "buzz-desktop: failed to restore managed agents on launch: {error}"
-                        );
-                    }
-                });
-            }
-
             // Carry the agent's knowledge from the legacy nest (~/.sprout) into
             // the live nest after it exists. Must run after ensure_nest() so the
             // destination is present. Non-fatal.
@@ -569,6 +541,18 @@ pub fn run() {
             // key is ephemeral.
             if !recovery_mode {
                 event_sync::spawn_event_sync(app_handle.clone(), owner_keys);
+            }
+
+            // Defer launch-time agent restoration until `apply_workspace` has
+            // installed the active workspace relay and identity. Starting here
+            // would race React initialization and send agents whose saved record
+            // has no relay override to the localhost fallback. Preserve the
+            // boot-time repos and identity recovery safety gates by only marking
+            // restoration pending when both allow it.
+            if restore_agents && !recovery_mode {
+                state
+                    .managed_agent_restore_pending
+                    .store(true, Ordering::Release);
             }
 
             if let Some(mgr) = huddle::models::global_model_manager() {
