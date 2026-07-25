@@ -364,6 +364,9 @@ fn write_agent_store(
 /// in the JSON. Mutates `records` (a save-local clone) — the caller's in-memory
 /// records keep their keys.
 fn persist_agent_keys(records: &mut [ManagedAgentRecord]) {
+    if std::env::var("BUZZ_KEEP_INLINE_AGENT_KEYS").ok().as_deref() == Some("1") {
+        return;
+    }
     let Some(store) = agent_secret_store() else {
         // No keyring backend: keys stay inline.
         return;
