@@ -255,6 +255,8 @@ fn hydrate_keys(records: &mut [ManagedAgentRecord]) {
 /// `spawn_agent_child`). Empty here never means "fine" — it means "no usable
 /// key this boot."
 fn hydrate_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) {
+    let keep_inline_agent_keys =
+        std::env::var("BUZZ_KEEP_INLINE_AGENT_KEYS").ok().as_deref() == Some("1");
     for record in records.iter_mut() {
         // A key-less definition (no pubkey yet — unified agent model) has no
         // keyring entry by construction; keys are minted on first start.
@@ -282,6 +284,9 @@ fn hydrate_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) 
                 }
             }
         } else {
+            if keep_inline_agent_keys {
+                continue;
+            }
             // Inline residue from a prior keyring-unreachable save. Lift it
             // into the keyring now (side effect) but KEEP it in memory — the
             // returned record must carry the key for readers. The next save
