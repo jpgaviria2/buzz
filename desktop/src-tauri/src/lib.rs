@@ -404,6 +404,7 @@ pub fn run() {
                 eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
                 std::process::exit(1);
             }
+            eprintln!("buzz-desktop: identity resolved, continuing managed-agent setup");
 
             // When the identity is in recovery mode (lost = keyring empty after
             // migration, or keyring-locked = keyring unreachable but marker
@@ -437,6 +438,7 @@ pub fn run() {
             if let Err(e) = backfill_persona_snapshots(&app_handle) {
                 eprintln!("buzz-desktop: persona-snapshot backfill failed: {e}");
             }
+            eprintln!("buzz-desktop: persona-snapshot backfill complete");
 
             // Store the AppHandle so huddle commands can emit `huddle-state-changed`
             // events via `huddle::emit_huddle_state` without threading the handle
@@ -495,6 +497,34 @@ pub fn run() {
                 Some(nest) => managed_agents::resolve_repos_at_boot(&nest),
                 None => true,
             };
+
+            if restore_agents && !recovery_mode {
+                state
+                    .managed_agent_restore_pending
+                    .store(false, Ordering::Release);
+                if let Ok(relay_url) = std::env::var("BUZZ_RELAY_URL") {
+                    let relay_url = relay_url.trim().to_string();
+                    if !relay_url.is_empty() {
+                        if let Ok(mut override_guard) = state.relay_url_override.lock() {
+                            *override_guard = Some(relay_url.clone());
+                        }
+                    }
+                }
+                let restore_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = restore_handle.state::<AppState>();
+                    if let Err(error) = managed_agents::restore_managed_agents_on_launch(
+                        &restore_handle,
+                        &state.shutdown_started,
+                    )
+                    .await
+                    {
+                        eprintln!(
+                            "buzz-desktop: failed to restore managed agents on launch: {error}"
+                        );
+                    }
+                });
+            }
 
             // Carry the agent's knowledge from the legacy nest (~/.sprout) into
             // the live nest after it exists. Must run after ensure_nest() so the
@@ -558,18 +588,6 @@ pub fn run() {
                         handle_deep_link_url(&dl_handle, url.as_str());
                     }
                 });
-            }
-
-            // Defer launch-time agent restoration until `apply_workspace` has
-            // installed the active workspace relay and identity. Starting here
-            // would race React initialization and send agents whose saved record
-            // has no relay override to the localhost fallback. Preserve the
-            // boot-time repos and identity recovery safety gates by only marking
-            // restoration pending when both allow it.
-            if restore_agents && !recovery_mode {
-                state
-                    .managed_agent_restore_pending
-                    .store(true, Ordering::Release);
             }
 
             // Periodic sweep: reap orphaned agents from dead instances every 60s.

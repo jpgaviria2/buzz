@@ -1223,6 +1223,32 @@ fn resolve_reply_anchor(
     )
 }
 
+fn is_multi_mention_turn(
+    thread_tags: &ThreadTags,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> bool {
+    let mentions = thread_tags.mentioned_pubkeys.len();
+    if mentions <= 1 {
+        return false;
+    }
+    match profile_lookup {
+        Some(profiles) => {
+            thread_tags
+                .mentioned_pubkeys
+                .iter()
+                .filter(|pk| {
+                    profiles
+                        .get(&normalize_lookup_key(pk))
+                        .map(|profile| profile.is_agent)
+                        .unwrap_or(false)
+                })
+                .count()
+                > 1
+        }
+        None => true,
+    }
+}
+
 /// Format a `[Context]` hints section based on event scope.
 ///
 /// `reply_anchor` is the pre-resolved `--reply-to` target for this turn (see
@@ -1465,7 +1491,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs are always 1:1 with a human, so they always anchor.
     let sender_pubkey = last_event.event.pubkey.to_hex();
-    let reply_anchor = if is_dm {
+    let multi_mention_turn = is_multi_mention_turn(&thread_tags, args.profile_lookup);
+    let reply_anchor = if multi_mention_turn {
+        None
+    } else if is_dm {
         thread_tags
             .root_event_id
             .is_some()
@@ -1478,14 +1507,20 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.profile_lookup,
         )
     };
-    sections.push(format_context_hints(
+    let mut context_hints = format_context_hints(
         batch.channel_id,
         args.channel_info,
         &thread_tags,
         is_dm,
         args.conversation_context.is_some(),
         reply_anchor.as_deref(),
-    ));
+    );
+    if multi_mention_turn {
+        context_hints.push_str(
+            "\nIMPORTANT: Multiple agents are tagged in this turn. Send your ordinary response without `--reply-to` so Block mobile shows each agent response directly in the conversation. If the human explicitly asks for a threaded reply, follow that request.",
+        );
+    }
+    sections.push(context_hints);
 
     // 3. Conversation context (thread or DM).
     if let Some(ctx) = args.conversation_context {
@@ -3288,6 +3323,24 @@ mod tests {
         let tags = thread_tags(None, &[AGENT_A_PK]);
         let anchor = resolve_reply_anchor(HUMAN_PK, &tags, TRIGGER_ID, Some(&id_lookup()));
         assert_eq!(anchor.as_deref(), Some(TRIGGER_ID));
+    }
+
+    #[test]
+    fn test_multi_agent_mentions_are_detected() {
+        let tags = thread_tags(None, &[AGENT_A_PK, AGENT_B_PK]);
+        assert!(is_multi_mention_turn(&tags, Some(&id_lookup())));
+    }
+
+    #[test]
+    fn test_single_agent_mentions_are_not_multi_mentions() {
+        let tags = thread_tags(None, &[AGENT_A_PK]);
+        assert!(!is_multi_mention_turn(&tags, Some(&id_lookup())));
+    }
+
+    #[test]
+    fn test_agent_and_human_mentions_are_not_multi_agent_mentions() {
+        let tags = thread_tags(None, &[AGENT_A_PK, HUMAN_PK]);
+        assert!(!is_multi_mention_turn(&tags, Some(&id_lookup())));
     }
 
     #[test]

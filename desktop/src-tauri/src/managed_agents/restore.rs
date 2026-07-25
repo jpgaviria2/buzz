@@ -47,7 +47,18 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
         .lock()
         .map_err(|error| error.to_string())?;
 
-    let mut records = load_managed_agents(app)?;
+    let raw_records = super::load_agent_store(app)?;
+    let needs_backfill = raw_records.iter().any(|r| {
+        !r.pubkey.is_empty() && r.persona_id.is_some() && r.persona_source_version.is_none()
+    });
+    if !needs_backfill {
+        return Ok(());
+    }
+
+    let mut records = raw_records
+        .into_iter()
+        .filter(|record| !record.pubkey.is_empty())
+        .collect::<Vec<_>>();
     let needs_backfill = records
         .iter()
         .any(|r| r.persona_id.is_some() && r.persona_source_version.is_none());
@@ -96,6 +107,7 @@ pub async fn restore_managed_agents_on_launch(
     app: &tauri::AppHandle,
     shutdown_started: &AtomicBool,
 ) -> Result<(), String> {
+    eprintln!("buzz-desktop: managed-agent restore started");
     if shutdown_started.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -114,7 +126,12 @@ pub async fn restore_managed_agents_on_launch(
             return Ok(());
         }
 
+        eprintln!("buzz-desktop: managed-agent restore loading records");
         let mut records = load_managed_agents(app)?;
+        eprintln!(
+            "buzz-desktop: managed-agent restore loaded {} records",
+            records.len()
+        );
         let mut runtimes = state
             .managed_agent_processes
             .lock()
@@ -171,6 +188,10 @@ pub async fn restore_managed_agents_on_launch(
             .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
             .map(|record| record.pubkey.clone())
             .collect();
+        eprintln!(
+            "buzz-desktop: managed-agent restore found {} launch candidates",
+            candidates.len()
+        );
 
         let mut to_start = Vec::new();
         for pubkey in &candidates {
@@ -225,6 +246,7 @@ pub async fn restore_managed_agents_on_launch(
     }
 
     if agents_to_start.is_empty() {
+        eprintln!("buzz-desktop: managed-agent restore has no agents to start");
         return Ok(());
     }
 
@@ -345,6 +367,7 @@ pub async fn restore_managed_agents_on_launch(
     });
 
     if spawn_results.is_empty() {
+        eprintln!("buzz-desktop: managed-agent restore had no spawn results");
         return Ok(());
     }
 
@@ -402,6 +425,10 @@ pub async fn restore_managed_agents_on_launch(
             }
         }
     }
+    eprintln!(
+        "buzz-desktop: managed-agent restore spawned {} agents",
+        successfully_spawned.len()
+    );
 
     // Collect profile reconciliation data for successfully spawned agents before
     // releasing the lock. This mirrors the fire-and-forget pattern in

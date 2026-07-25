@@ -24,7 +24,12 @@ use crate::state::{run_registered_community_connection, AppState};
 use buzz_pubsub::EventTopic;
 
 /// Maximum time a new socket may hold a connection slot without completing NIP-42 auth.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Mobile clients can take several seconds to wake secure storage, derive the
+/// signing key, and complete the NIP-42 response on a fresh pairing. Keep the
+/// relay bound, but avoid closing legitimate phone handshakes before the app's
+/// own 8s auth timeout has a chance to complete.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Shared mutable subscription map for a single WebSocket connection.
 pub(crate) type ConnectionSubscriptions = Arc<Mutex<HashMap<String, Vec<Filter>>>>;
