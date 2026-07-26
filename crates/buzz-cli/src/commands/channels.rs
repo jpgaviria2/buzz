@@ -14,10 +14,24 @@ use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
 
 fn extract_channel_metadata(e: &serde_json::Value) -> serde_json::Value {
+    let hidden = e
+        .get("tags")
+        .and_then(|tags| tags.as_array())
+        .map(|tags| {
+            tags.iter().any(|tag| {
+                tag.as_array()
+                    .and_then(|parts| parts.first())
+                    .and_then(|value| value.as_str())
+                    == Some("hidden")
+            })
+        })
+        .unwrap_or(false);
     serde_json::json!({
         "channel_id": extract_d_tag(e),
         "name": extract_tag_value(e, "name"),
         "description": extract_tag_value(e, "about"),
+        "channel_type": extract_tag_value(e, "t"),
+        "hidden": hidden,
         "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
     })
 }
@@ -1177,9 +1191,9 @@ pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Resu
 mod tests {
     use super::{
         apply_cardinality_rule, build_template_report, cmd_set_add_policy,
-        finalize_roster_resolution, name_matches, resolve_roster_with_archive_filter,
-        validate_ttl_seconds, ArchivedExclusion, ChannelSummary, ResolvedAgent, RosterResolution,
-        SkippedSlug,
+        extract_channel_metadata, finalize_roster_resolution, name_matches,
+        resolve_roster_with_archive_filter, validate_ttl_seconds, ArchivedExclusion,
+        ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
     };
     use crate::client::BuzzClient;
     use crate::CliError;
@@ -1187,6 +1201,23 @@ mod tests {
 
     fn event(tags: serde_json::Value) -> serde_json::Value {
         json!({ "tags": tags })
+    }
+
+    #[test]
+    fn list_projection_preserves_authoritative_channel_type_and_hidden_flag() {
+        let ev = json!({
+            "created_at": 123,
+            "tags": [
+                ["d", "11111111-1111-1111-1111-111111111111"],
+                ["name", "Group DM (3)"],
+                ["t", "dm"],
+                ["hidden"],
+                ["private"]
+            ]
+        });
+        let projected = extract_channel_metadata(&ev);
+        assert_eq!(projected["channel_type"], "dm");
+        assert_eq!(projected["hidden"], true);
     }
 
     #[test]
