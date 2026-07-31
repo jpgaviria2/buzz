@@ -215,6 +215,50 @@ async fn is_owner_or_sibling(
     is_sibling
 }
 
+fn has_tag_value(event: &nostr::Event, tag_name: &str, tag_value: &str) -> bool {
+    event.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.first().map(|v| v.as_str()) == Some(tag_name)
+            && parts
+                .get(1)
+                .map(|v| v.eq_ignore_ascii_case(tag_value))
+                .unwrap_or(false)
+    })
+}
+
+fn workflow_owner_backed_by_relay_event(
+    event: &nostr::Event,
+    owner_pubkey: &str,
+    relay_pubkey: &str,
+) -> bool {
+    event.kind.as_u16() as u32 == KIND_STREAM_MESSAGE
+        && event.pubkey.to_hex().eq_ignore_ascii_case(relay_pubkey)
+        && has_tag_value(event, "buzz:workflow", "true")
+        && has_tag_value(event, "p", owner_pubkey)
+}
+
+/// Whether a relay-signed workflow post should be treated as owner-backed.
+///
+/// Workflow messages are signed by the relay, not by the user who configured
+/// or triggered the workflow. The relay stamps them with `buzz:workflow=true`
+/// plus a `p` tag for that owner. Owner-only agents may trust that envelope
+/// only when the signer matches the relay's public NIP-11 `self` key.
+async fn workflow_owner_backed_by_relay(
+    event: &nostr::Event,
+    owner_cache: &OwnerCache,
+    rest_client: &relay::RestClient,
+) -> bool {
+    let owner_pubkey = match owner_cache.get() {
+        Some(owner) => owner,
+        None => return false,
+    };
+    let relay_pubkey = match rest_client.relay_self_pubkey().await {
+        Some(pubkey) => pubkey,
+        None => return false,
+    };
+    workflow_owner_backed_by_relay_event(event, owner_pubkey, &relay_pubkey)
+}
+
 /// Inbound author gate decision: does this author's event fire a turn?
 ///
 /// Coarse security policy applied before subscription rules. Both `OwnerOnly`
@@ -2158,7 +2202,15 @@ async fn tokio_main() -> Result<()> {
                                     &ctx.rest_client,
                                 )
                                 .await;
-                                if !allowed {
+                                let workflow_owner_backed = !allowed
+                                    && !is_dm
+                                    && workflow_owner_backed_by_relay(
+                                        &buzz_event.event,
+                                        &owner_cache,
+                                        &ctx.rest_client,
+                                    )
+                                    .await;
+                                if !allowed && !workflow_owner_backed {
                                     tracing::debug!(
                                         channel_id = %buzz_event.channel_id,
                                         author = %buzz_event.event.pubkey.to_hex(),
@@ -2167,6 +2219,13 @@ async fn tokio_main() -> Result<()> {
                                         "inbound author gate — dropping event"
                                     );
                                     continue;
+                                } else if workflow_owner_backed {
+                                    tracing::debug!(
+                                        channel_id = %buzz_event.channel_id,
+                                        author = %buzz_event.event.pubkey.to_hex(),
+                                        mode = %config.respond_to,
+                                        "inbound author gate — accepting relay-signed owner-backed workflow event"
+                                    );
                                 }
                             }
 
@@ -4436,6 +4495,68 @@ mod author_gate_tests {
     const SIBLING: &str = "11";
     const EXTERNAL: &str = "22";
     const STRANGER: &str = "33";
+
+    fn make_workflow_event(
+        signing_keys: &nostr::Keys,
+        owner_pubkey: &str,
+        extra_tags: Vec<nostr::Tag>,
+    ) -> nostr::Event {
+        let mut tags = vec![
+            nostr::Tag::parse(["p", owner_pubkey]).expect("owner p tag"),
+            nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow tag"),
+        ];
+        tags.extend(extra_tags);
+        nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "@Brewie")
+            .tags(tags)
+            .sign_with_keys(signing_keys)
+            .expect("signed workflow event")
+    }
+
+    #[test]
+    fn test_workflow_owner_backed_requires_relay_signer_owner_tag_and_workflow_tag() {
+        let relay_keys = nostr::Keys::generate();
+        let stranger_keys = nostr::Keys::generate();
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let relay_pubkey = relay_keys.public_key().to_hex();
+
+        let valid = make_workflow_event(&relay_keys, &owner, vec![]);
+        assert!(workflow_owner_backed_by_relay_event(
+            &valid,
+            &owner,
+            &relay_pubkey
+        ));
+
+        let wrong_signer = make_workflow_event(&stranger_keys, &owner, vec![]);
+        assert!(!workflow_owner_backed_by_relay_event(
+            &wrong_signer,
+            &owner,
+            &relay_pubkey
+        ));
+
+        let missing_owner_tag =
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "@Brewie")
+                .tags([nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow tag")])
+                .sign_with_keys(&relay_keys)
+                .expect("signed missing-owner event");
+        assert!(!workflow_owner_backed_by_relay_event(
+            &missing_owner_tag,
+            &owner,
+            &relay_pubkey
+        ));
+
+        let wrong_kind = nostr::EventBuilder::new(nostr::Kind::Custom(1), "@Brewie")
+            .tags([
+                nostr::Tag::parse(["p", owner.as_str()]).expect("owner p tag"),
+                nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow tag"),
+            ])
+            .sign_with_keys(&relay_keys)
+            .expect("signed wrong-kind event");
+        assert!(!workflow_owner_backed_by_relay_event(
+            &wrong_kind,
+            &owner,
+            &relay_pubkey
+        ));
+    }
 
     /// Owner + a known sibling, none of them on the explicit allowlist.
     fn cache_with_sibling() -> OwnerCache {

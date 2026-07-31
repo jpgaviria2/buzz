@@ -119,6 +119,7 @@ use buzz_core::kind::{
 };
 use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, EventBuilder, Keys, Kind, RelayUrl, Tag};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -238,6 +239,12 @@ pub struct RestClient {
     pub auth_tag_json: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RelayInfoDoc {
+    #[serde(rename = "self")]
+    relay_self: Option<String>,
+}
+
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
 fn is_retriable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
@@ -259,6 +266,33 @@ fn unix_now_secs() -> u64 {
 }
 
 impl RestClient {
+    /// Fetch the relay's NIP-11 `self` signing pubkey.
+    ///
+    /// This is intentionally unauthenticated: NIP-11 is the relay's public
+    /// identity document. Callers that use it for trust decisions must still
+    /// fail closed when it is absent or malformed.
+    pub async fn relay_self_pubkey(&self) -> Option<String> {
+        let resp = tokio::time::timeout(
+            Duration::from_millis(2000),
+            self.http
+                .get(&self.base_url)
+                .header("Accept", "application/nostr+json")
+                .send(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let info = resp.json::<RelayInfoDoc>().await.ok()?;
+        let relay_self = info.relay_self?.to_ascii_lowercase();
+        nostr::PublicKey::from_hex(&relay_self).ok()?;
+        Some(relay_self)
+    }
+
     /// Sign a NIP-98 HTTP Auth event (kind:27235) for the given method/URL/body.
     ///
     /// Returns the `Authorization: Nostr <base64>` header value (without the
