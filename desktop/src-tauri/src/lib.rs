@@ -561,7 +561,14 @@ pub fn run() {
             // hold the boot path hostage. Skipped in recovery mode — the owner
             // key is ephemeral.
             if !recovery_mode {
-                event_sync::spawn_event_sync(app_handle.clone(), owner_keys);
+                match managed_agents::retention::active_retention_scope(&app_handle, &state) {
+                    Ok(scope) => event_sync::spawn_event_sync(
+                        app_handle.clone(),
+                        scope.owner_keys,
+                        scope.db_path,
+                    ),
+                    Err(error) => eprintln!("buzz-desktop: event-sync: scope failed: {error}"),
+                }
             }
 
             // Defer launch-time agent restoration until `apply_workspace` has
