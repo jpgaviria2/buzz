@@ -259,11 +259,7 @@ pub fn run() {
     let builder = builder.plugin({
         use tauri_plugin_global_shortcut::ShortcutState;
 
-        // Generation counter for the release delay task. Incremented on
-        // every press — a delayed release only fires if the generation
-        // hasn't changed (i.e. no new press happened during the delay).
-        // This prevents press→release→press within 200 ms from having
-        // the first release clobber the second press.
+        // Prevent a delayed release from clobbering a new press.
         let ptt_press_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         tauri_plugin_global_shortcut::Builder::new()
@@ -297,36 +293,26 @@ pub fn run() {
                         if let Ok(hs) = state.huddle_state.lock() {
                             hs.ptt_active
                                 .store(true, std::sync::atomic::Ordering::Release);
-                            // Only cancel TTS if it's actually playing — avoids
-                            // a stale cancel flag that drops the next queued message.
+                            // Avoid a stale cancel flag dropping the next queued message.
                             if hs.tts_active.load(std::sync::atomic::Ordering::Acquire) {
                                 hs.tts_cancel
                                     .store(true, std::sync::atomic::Ordering::Release);
                             }
                         }
-                        // Emit ptt-state=true to the frontend.
-                        // The React side plays the press audio cue on this event
-                        // (Web Audio API via HuddleContext). Rust-side rodio audio
-                        // was considered but rejected: the rodio OutputStream must
-                        // outlive the handler and sharing it across the shortcut
-                        // closure adds lifecycle complexity for marginal gain.
-                        // The React implementation is sufficient and simpler.
+                        // React plays the press cue from this event.
                         let _ = app.emit("ptt-state", true);
                     }
                     ShortcutState::Released => {
-                        // Capture generation at release time.
                         let gen_at_release =
                             ptt_press_gen.load(std::sync::atomic::Ordering::Acquire);
                         let gen_arc = Arc::clone(&ptt_press_gen);
                         let app_handle = app.clone();
-                        // 200 ms release delay — captures the tail of the utterance.
-                        // Only applies if no new press happened during the delay.
+                        // Delay release to capture the tail of the utterance.
                         tauri::async_runtime::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            // Check generation — if it changed, a new press arrived.
                             if gen_arc.load(std::sync::atomic::Ordering::Acquire) != gen_at_release
                             {
-                                return; // Superseded by a new press.
+                                return;
                             }
                             if let Some(state) = app_handle.try_state::<AppState>() {
                                 if let Ok(hs) = state.huddle_state.lock() {
@@ -334,7 +320,6 @@ pub fn run() {
                                         .store(false, std::sync::atomic::Ordering::Release);
                                 }
                             }
-                            // Emit ptt-state=false — React plays the release audio cue.
                             let _ = app_handle.emit("ptt-state", false);
                         });
                     }
@@ -373,10 +358,6 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             tray_menu::init(&app_handle)?;
 
-            // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
-            // Must run before migrations and identity resolution so the wipe
-            // completes atomically on crash recovery.
-            //
             // init_nest_dir is called early here (normally it runs inside
             // run_boot_migrations) so reset::run_boot_reset can call nest_dir().
             let reset_outcome = if let Ok(data_dir) = app_handle.path().app_data_dir() {
@@ -410,9 +391,7 @@ pub fn run() {
             }
 
             // Resolve persisted identity key (env var → file → generate+save).
-            // This is fatal — the app should not start with an ephemeral identity
-            // that will be lost on restart, as that silently breaks channel
-            // memberships, DMs, and relay identity.
+            // Fatal: an ephemeral restart identity breaks memberships, DMs, and relay identity.
             let state = app_handle.state::<AppState>();
             if let Err(e) = resolve_persisted_identity(&app_handle, &state) {
                 eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
@@ -444,10 +423,7 @@ pub fn run() {
             }
             eprintln!("buzz-desktop: persona-snapshot backfill complete");
 
-            // Warm the loaded-harness registry BEFORE restore so cold-launch
-            // agent spawns can resolve custom/preset runtime ids without
-            // waiting for the frontend's discover_acp_providers call.  This is
-            // a pure directory scan — no PATH probing, no async work.
+            // Warm the registry before restore so cold-launch agents resolve runtime ids.
             {
                 let custom_dir = app_handle
                     .path()
@@ -459,9 +435,7 @@ pub fn run() {
                 );
             }
 
-            // Store the AppHandle so huddle commands can emit `huddle-state-changed`
-            // events via `huddle::emit_huddle_state` without threading the handle
-            // through every call site.
+            // Store AppHandle for huddle event emission.
             if let Ok(mut guard) = state.app_handle.lock() {
                 *guard = Some(app_handle.clone());
             }
