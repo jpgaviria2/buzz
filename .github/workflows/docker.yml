@@ -121,7 +121,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify tag-bound release source
-        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.version != '')
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
@@ -528,7 +528,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Verify tag-bound release source
-        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.version != '')
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
