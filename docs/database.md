@@ -439,6 +439,19 @@ values, MUST be handled safely by the old one. This means ignoring them,
 leaving them for the new release, or failing closed. The old release MUST NOT
 misinterpret them.
 
+## Support-only admission
+
+Support customers are represented by `support_grants`, never by `relay_members`.
+Each tenant-scoped grant binds one customer pubkey to one private DM and the exact
+configured support and escalation pubkeys. `revoked_at` and `expires_at` are
+checked on NIP-42 admission and every support read/write authorization. Active
+grant lookup also verifies that the DM roster still contains exactly those three
+participants.
+
+`support_admission_nonces` is the durable, community-scoped replay set for the
+required NIP-98 `nonce` tag. Only SHA-256 nonce hashes are stored. Both tables are
+covered by the community write fence and migration `0080_support_admission.sql`.
+
 ## Review checklist
 
 A PR that touches the schema or a schema-dependent query states in its

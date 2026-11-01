@@ -95,7 +95,7 @@ pub(crate) async fn community_ban_outcome(
 }
 
 /// Ban verdict for one key, without any owner cascade.
-async fn principal_ban_outcome(
+pub(crate) async fn principal_ban_outcome(
     state: &AppState,
     community: buzz_core::CommunityId,
     key: &nostr::PublicKey,
@@ -204,6 +204,7 @@ pub(crate) async fn final_admission_denial(
     auth_tag_json: Option<&str>,
     signed_auth_created_at: Option<u64>,
     token_owner: Option<nostr::PublicKey>,
+    allow_support_grant: bool,
 ) -> Option<AdmissionDenial> {
     let ban = community_ban_outcome(
         state,
@@ -228,6 +229,26 @@ pub(crate) async fn final_admission_denial(
     )
     .await
     {
+        Ok(crate::api::relay_members::MembershipDecision::Denied) if allow_support_grant => {
+            match crate::api::support::active_grant(state, community, &pubkey).await {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(AdmissionDenial {
+                    metric: "not_relay_member",
+                    reason: "restricted: not a relay member",
+                    outcome: AuthOutcome::NotRelayMember,
+                    class: buzz_auth::DenialClass::AuthorizationDenied,
+                }),
+                Err(e) => {
+                    warn!(pubkey = %pubkey.to_hex(), error = %e, "support grant recheck failed, denying (fail-closed)");
+                    Some(AdmissionDenial {
+                        metric: "support_grant_check_error",
+                        reason: "error: internal error checking support grant",
+                        outcome: AuthOutcome::RelayMembershipCheckError,
+                        class: buzz_auth::DenialClass::AuthorizationUnavailable,
+                    })
+                }
+            }
+        }
         Ok(crate::api::relay_members::MembershipDecision::Denied) => Some(AdmissionDenial {
             metric: "not_relay_member",
             reason: "restricted: not a relay member",
@@ -534,9 +555,15 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
             }
 
-            // Pubkey allowlist gate — only for pubkey-only auth.
+            let support_grant =
+                crate::api::support::active_grant(&state, conn.tenant.community(), &pubkey).await;
+
+            // Pubkey allowlist gate — only for pubkey-only auth. An active
+            // support-only grant is a separate admission authority and bypasses
+            // this community-membership allowlist without creating membership.
             if state.config.pubkey_allowlist_enabled
                 && auth_ctx.auth_method == buzz_auth::AuthMethod::Nip42
+                && !matches!(&support_grant, Ok(Some(_)))
             {
                 let allowlist = state
                     .db
@@ -611,24 +638,33 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             let nip_oa_owner = match classify_relay_membership(membership) {
                 PolicyCheck::Allowed(owner) => owner,
                 PolicyCheck::Denied => {
-                    warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "not a relay member");
-                    metrics::counter!("buzz_auth_failures_total", "reason" => "not_relay_member")
-                        .increment(1);
-                    if !conn.reject_auth(AuthOutcome::NotRelayMember) {
+                    if let Ok(Some(grant)) = support_grant {
+                        auth_ctx.scopes = vec![
+                            buzz_auth::Scope::MessagesRead,
+                            buzz_auth::Scope::MessagesWrite,
+                        ];
+                        auth_ctx.channel_ids = Some(vec![grant.channel_id]);
+                        None
+                    } else {
+                        warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "not a relay member");
+                        metrics::counter!("buzz_auth_failures_total", "reason" => "not_relay_member")
+                            .increment(1);
+                        if !conn.reject_auth(AuthOutcome::NotRelayMember) {
+                            return;
+                        }
+                        // With an FI assertion, membership status must not be
+                        // distinguishable from a ban or allowlist denial.
+                        if conn.nip_fi_assertion.is_some() {
+                            deny_nip_fi_auth(&conn, buzz_auth::DenialClass::AuthorizationDenied);
+                            return;
+                        }
+                        conn.send(RelayMessage::ok(
+                            &event_id_hex,
+                            false,
+                            "restricted: not a relay member",
+                        ));
                         return;
                     }
-                    // With an FI assertion, membership status must not be
-                    // distinguishable from a ban or allowlist denial.
-                    if conn.nip_fi_assertion.is_some() {
-                        deny_nip_fi_auth(&conn, buzz_auth::DenialClass::AuthorizationDenied);
-                        return;
-                    }
-                    conn.send(RelayMessage::ok(
-                        &event_id_hex,
-                        false,
-                        "restricted: not a relay member",
-                    ));
-                    return;
                 }
                 PolicyCheck::DependencyError => {
                     metrics::counter!("buzz_auth_failures_total", "reason" => "relay_membership_check_error")
@@ -765,6 +801,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 auth_tag_json.as_deref(),
                 Some(signed_auth_created_at),
                 token_owner,
+                true,
             )
             .await
             {

@@ -116,6 +116,8 @@ const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
     "/_readiness",
     // Pre-membership enrollment door — identity not yet issued
     "/api/invites/claim",
+    // Pre-membership support-only admission — strict NIP-98 inside handler
+    "/api/support/admit",
     // Pre-membership policy gate — no NIP-98 principal yet
     "/api/invites/accept-policy",
     // Public policy documents — exact path + subtree
@@ -403,6 +405,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(api::invites::accept_policy),
         )
         .route("/api/invites/claim", post(api::invites::claim_invite))
+        .route("/api/support/admit", post(api::support::admit))
         // NIP-FI admin command API — authenticated by signed command JWT,
         // NOT by NIP-98.  Self-contained auth inside the handler.
         .route("/api/nip-fi/disconnect", post(api::nip_fi::disconnect))

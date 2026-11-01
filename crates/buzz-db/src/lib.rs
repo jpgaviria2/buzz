@@ -69,7 +69,7 @@ pub use store::{
     channel_members, community, deletion, dm, entity_deletion, event, feed, git_repo, moderation,
     nip_fi_binding, operator_listener, partition, personal_read, product_feedback, push, reaction,
     read_state, relay_admin_actions, relay_invite, relay_members, relay_operators, reminder,
-    replaceable, storage_accounting, thread, thread_window, usage, user, user_deletion,
+    replaceable, storage_accounting, support, thread, thread_window, usage, user, user_deletion,
     user_deletion_fences, workflow,
 };
 
@@ -87,6 +87,7 @@ pub use nip_fi_binding::{NipFiBindingRecord, NipFiUnbind, RowCapExceeded};
 pub use reaction::ReactionEventInsertOutcome;
 pub use reminder::DueReminder;
 pub use store::{ArtifactSnapshot, SnapshotDenied};
+pub use support::{SupportAdmission, SupportGrant};
 pub use usage::SessionLeader;
 
 use buzz_core::CommunityId;

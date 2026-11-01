@@ -777,10 +777,19 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 79);
+        assert_eq!(migrations.len(), 80);
         for (index, migration) in migrations.iter().enumerate() {
             assert_eq!(migration.version, (index + 1) as i64);
         }
+        assert_eq!(migrations[79].version, 80);
+        assert!(migrations[79]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE support_grants"));
+        assert!(migrations[79]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE support_admission_nonces"));
         assert!(migrations[70]
             .sql
             .as_str()
@@ -2469,6 +2478,17 @@ mod postgres_tests {
             .as_str()
             .contains("attach_community_write_fence('community_nip_fi_issuers')"));
         expected_fences.insert("community_nip_fi_issuers".to_owned());
+        // 0080 adds the tenant-scoped support admission tables and fences both.
+        let support_admission = MIGRATOR
+            .iter()
+            .find(|m| m.version == 80)
+            .expect("support admission migration")
+            .sql
+            .as_str();
+        for table in ["support_grants", "support_admission_nonces"] {
+            assert!(support_admission.contains(&format!("attach_community_write_fence('{table}')")));
+            expected_fences.insert(table.to_owned());
+        }
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"

@@ -101,6 +101,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i tables/public/relay_members.sql
 \i tables/public/join_policy_acceptances.sql
 \i tables/public/relay_invites.sql
+\i tables/public/support_grants.sql
+\i tables/public/support_admission_nonces.sql
 \i tables/public/archived_identities.sql
 \i tables/public/audit_log.sql
 \i tables/public/moderation_actions.sql
@@ -174,6 +176,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i triggers/push_wake_outbox.sql
 \i triggers/reactions.sql
 \i triggers/relay_invites.sql
+\i triggers/support_grants.sql
+\i triggers/support_admission_nonces.sql
 \i triggers/relay_members.sql
 \i triggers/scheduled_workflow_fires.sql
 \i triggers/subscriptions.sql

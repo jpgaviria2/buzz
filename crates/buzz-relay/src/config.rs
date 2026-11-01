@@ -85,6 +85,32 @@ pub struct JoinPolicyConfig {
     pub version: String,
 }
 
+/// One rotatable support-admission capability, stored only as a SHA-256 hash.
+#[derive(Debug, Clone)]
+pub struct SupportCapabilityConfig {
+    /// Operator-defined rotation identifier written to grants and audit logs.
+    pub generation: String,
+    /// SHA-256 of the opaque public capability; raw capability is never retained.
+    pub capability_hash: [u8; 32],
+    /// Capability expiration as Unix seconds.
+    pub expires_at: i64,
+    /// Explicit rotation-time revocation switch.
+    pub revoked: bool,
+}
+
+/// Server-managed support-only admission configuration.
+#[derive(Debug, Clone)]
+pub struct SupportAdmissionConfig {
+    /// Trails/Hermes support participant.
+    pub support_pubkey: nostr::PublicKey,
+    /// JP participant and sole permitted escalation target.
+    pub escalation_pubkey: nostr::PublicKey,
+    /// Lifetime of a customer grant issued by admission.
+    pub grant_ttl_secs: u64,
+    /// Active and historical capability generations used for rotation.
+    pub capabilities: Vec<SupportCapabilityConfig>,
+}
+
 /// Optional KLIPY GIF-search integration owned by the relay operator.
 ///
 /// The API key deliberately stays private and its [`Debug`] implementation is
@@ -227,6 +253,9 @@ pub struct Config {
     /// When false (default), the check is a no-op and all authenticated callers
     /// are permitted regardless of auth method (API token, NIP-42).
     pub require_relay_membership: bool,
+
+    /// Optional support-only admission plane. Disabled when unconfigured.
+    pub support_admission: Option<SupportAdmissionConfig>,
 
     /// Whether this deployment can serve huddle (voice) audio.
     ///
@@ -653,6 +682,111 @@ fn inert_env_vars<'a>(names: &[&'a str], lookup: impl Fn(&str) -> Option<String>
         .copied()
         .filter(|name| lookup(name).is_some())
         .collect()
+}
+
+fn support_admission_from_env() -> Result<Option<SupportAdmissionConfig>, ConfigError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawCapability {
+        generation: String,
+        capability: String,
+        expires_at: i64,
+        #[serde(default)]
+        revoked: bool,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawSupportConfig {
+        support_pubkey: String,
+        escalation_pubkey: String,
+        #[serde(default = "default_grant_ttl")]
+        grant_ttl_secs: u64,
+        capabilities: Vec<RawCapability>,
+    }
+    fn default_grant_ttl() -> u64 {
+        30 * 24 * 60 * 60
+    }
+
+    let raw = match std::env::var("BUZZ_SUPPORT_ADMISSION_JSON") {
+        Ok(raw) if !raw.trim().is_empty() => raw,
+        Ok(_) | Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_SUPPORT_ADMISSION_JSON must be valid UTF-8: {error}"
+            )))
+        }
+    };
+    let parsed: RawSupportConfig = serde_json::from_str(&raw).map_err(|error| {
+        ConfigError::InvalidValue(format!("invalid BUZZ_SUPPORT_ADMISSION_JSON: {error}"))
+    })?;
+    fn exact_lower_hex_pubkey(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+    if !exact_lower_hex_pubkey(&parsed.support_pubkey)
+        || !exact_lower_hex_pubkey(&parsed.escalation_pubkey)
+    {
+        return Err(ConfigError::InvalidValue(
+            "BUZZ_SUPPORT_ADMISSION_JSON pubkeys must be exact 64-char lowercase hex".into(),
+        ));
+    }
+    let support_pubkey = nostr::PublicKey::from_hex(&parsed.support_pubkey).map_err(|_| {
+        ConfigError::InvalidValue(
+            "BUZZ_SUPPORT_ADMISSION_JSON support_pubkey must be 64-char hex".into(),
+        )
+    })?;
+    let escalation_pubkey =
+        nostr::PublicKey::from_hex(&parsed.escalation_pubkey).map_err(|_| {
+            ConfigError::InvalidValue(
+                "BUZZ_SUPPORT_ADMISSION_JSON escalation_pubkey must be 64-char hex".into(),
+            )
+        })?;
+    if support_pubkey == escalation_pubkey {
+        return Err(ConfigError::InvalidValue(
+            "support and escalation pubkeys must be distinct".into(),
+        ));
+    }
+    if parsed.grant_ttl_secs == 0 || parsed.grant_ttl_secs > 90 * 24 * 60 * 60 {
+        return Err(ConfigError::InvalidValue(
+            "support grant_ttl_secs must be in 1..=7776000".into(),
+        ));
+    }
+    if parsed.capabilities.is_empty() || parsed.capabilities.len() > 8 {
+        return Err(ConfigError::InvalidValue(
+            "support capabilities must contain 1..=8 generations".into(),
+        ));
+    }
+    let mut generations = std::collections::HashSet::new();
+    let mut capabilities = Vec::with_capacity(parsed.capabilities.len());
+    for capability in parsed.capabilities {
+        if capability.generation.is_empty()
+            || capability.generation.len() > 128
+            || !generations.insert(capability.generation.clone())
+        {
+            return Err(ConfigError::InvalidValue(
+                "support capability generations must be unique and 1..=128 bytes".into(),
+            ));
+        }
+        if !(32..=512).contains(&capability.capability.len()) {
+            return Err(ConfigError::InvalidValue(
+                "support capabilities must contain 32..=512 bytes".into(),
+            ));
+        }
+        capabilities.push(SupportCapabilityConfig {
+            generation: capability.generation,
+            capability_hash: Sha256::digest(capability.capability.as_bytes()).into(),
+            expires_at: capability.expires_at,
+            revoked: capability.revoked,
+        });
+    }
+    Ok(Some(SupportAdmissionConfig {
+        support_pubkey,
+        escalation_pubkey,
+        grant_ttl_secs: parsed.grant_ttl_secs,
+        capabilities,
+    }))
 }
 
 impl Config {
@@ -1413,6 +1547,7 @@ impl Config {
         };
 
         let nip_fi = crate::nip_fi_config::NipFiRelayConfig::from_env()?;
+        let support_admission = support_admission_from_env()?;
         let nip_fi_provision_binding = crate::nip_fi_config::parse_provision_binding()?;
         let nip_fi_resolver_bounds =
             crate::nip_fi_resolver::ResolverBounds::from_env(db_pool_size)?;
@@ -1457,6 +1592,7 @@ impl Config {
             partition_manager_advance_enabled,
             pubkey_allowlist_enabled,
             require_relay_membership,
+            support_admission,
             artifact_incremental_enabled,
             huddle_audio_available,
             mesh,

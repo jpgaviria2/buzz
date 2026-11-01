@@ -60,7 +60,7 @@ pub async fn handle_req(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
-    let (conn_id, pubkey_bytes, token_channel_ids) = {
+    let (conn_id, pubkey_bytes, auth_pubkey, token_channel_ids, support_only) = {
         match conn.auth_state_snapshot() {
             AuthState::Authenticated(ctx) => {
                 if !ctx.scopes.is_empty() && !ctx.scopes.contains(&Scope::MessagesRead) {
@@ -85,7 +85,13 @@ pub async fn handle_req(
                     return;
                 }
 
-                (conn.conn_id, pk_bytes, ctx.channel_ids.clone())
+                (
+                    conn.conn_id,
+                    pk_bytes,
+                    ctx.pubkey,
+                    ctx.channel_ids.clone(),
+                    crate::api::support::is_support_only_context(&ctx),
+                )
             }
             _ => {
                 conn.send(RelayMessage::notice(
@@ -113,7 +119,51 @@ pub async fn handle_req(
         }
     };
 
-    let mut accessible_channels = if filters_are_nip43_membership_only(&filters) {
+    let mut support_channel_id = None;
+    if support_only {
+        let grant =
+            match crate::api::support::active_grant(&state, conn.tenant.community(), &auth_pubkey)
+                .await
+            {
+                Ok(Some(grant)) => grant,
+                Ok(None) => {
+                    super::close::refuse(
+                        &sub_id,
+                        "restricted: support grant expired or revoked",
+                        &conn,
+                        &state,
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    warn!(%error, "support grant read authorization failed");
+                    super::close::refuse(
+                        &sub_id,
+                        "error: support authorization unavailable",
+                        &conn,
+                        &state,
+                    )
+                    .await;
+                    return;
+                }
+            };
+        if !crate::api::support::validate_support_filters(&filters, &grant) {
+            super::close::refuse(
+                &sub_id,
+                "restricted: support subscriptions must target the authorized DM or its participants",
+                &conn,
+                &state,
+            )
+            .await;
+            return;
+        }
+        support_channel_id = Some(grant.channel_id);
+    }
+
+    let mut accessible_channels = if let Some(channel_id) = support_channel_id {
+        vec![channel_id]
+    } else if filters_are_nip43_membership_only(&filters) {
         metrics::counter!("buzz_req_global_access_resolution_skips_total", "kind" => "13534")
             .increment(1);
         Vec::new()

@@ -68,6 +68,8 @@ pub mod reminder;
 pub mod replaceable;
 /// Durable completed snapshots from the isolated media-storage worker.
 pub mod storage_accounting;
+/// Support-only admission grants and nonce replay protection.
+pub mod support;
 /// Thread metadata persistence.
 pub mod thread;
 /// Strict newest-first thread windows and auxiliary scans.

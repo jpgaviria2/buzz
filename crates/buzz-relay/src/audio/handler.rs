@@ -1023,6 +1023,7 @@ async fn run_active_audio_connection(
                 auth_tag_json.as_deref(),
                 Some(signed_auth_created_at),
                 token_owner,
+                false,
             )
             .await
         }

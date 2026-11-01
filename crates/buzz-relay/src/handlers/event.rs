@@ -669,7 +669,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     )
     .increment(1);
 
-    let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids) = {
+    let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids, support_only) = {
         match conn.auth_state_snapshot() {
             AuthState::Authenticated(ctx) => (
                 conn.conn_id,
@@ -677,6 +677,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
                 ctx.pubkey,
                 ctx.scopes.clone(),
                 ctx.channel_ids.clone(),
+                crate::api::support::is_support_only_context(&ctx),
             ),
             _ => {
                 reject("auth");
@@ -712,6 +713,48 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             "invalid: AUTH events cannot be submitted via EVENT",
         ));
         return;
+    }
+
+    if support_only {
+        let grant =
+            match crate::api::support::active_grant(&state, conn.tenant.community(), &auth_pubkey)
+                .await
+            {
+                Ok(Some(grant)) => grant,
+                Ok(None) => {
+                    reject("restricted");
+                    conn.send(RelayMessage::ok(
+                        &event_id_hex,
+                        false,
+                        "restricted: support grant expired or revoked",
+                    ));
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "support grant check failed");
+                    reject("error");
+                    conn.send(RelayMessage::ok(
+                        &event_id_hex,
+                        false,
+                        "error: support authorization unavailable",
+                    ));
+                    return;
+                }
+            };
+        if let Err(reason) = crate::api::support::validate_support_event(&event, &grant) {
+            reject("scope");
+            conn.send(RelayMessage::ok(&event_id_hex, false, reason));
+            return;
+        }
+        if crate::api::support::message_rate_limited(conn.tenant.community(), &auth_pubkey) {
+            reject("quota");
+            conn.send(RelayMessage::ok(
+                &event_id_hex,
+                false,
+                "rate-limited: support message quota exceeded",
+            ));
+            return;
+        }
     }
 
     // Observer frames and ephemeral kinds return before ingest, so they take

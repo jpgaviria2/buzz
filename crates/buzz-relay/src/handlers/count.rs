@@ -24,10 +24,15 @@ pub async fn handle_count(
     state: Arc<AppState>,
 ) {
     // Require auth
-    let (pubkey_bytes, token_channel_ids) = {
+    let (pubkey_bytes, token_channel_ids, support_only) = {
         match conn.auth_state_snapshot() {
             AuthState::Authenticated(ctx) => {
-                (ctx.pubkey.to_bytes().to_vec(), ctx.channel_ids.clone())
+                let support_only = crate::api::support::is_support_only_context(&ctx);
+                (
+                    ctx.pubkey.to_bytes().to_vec(),
+                    ctx.channel_ids.clone(),
+                    support_only,
+                )
             }
             _ => {
                 conn.send(RelayMessage::closed(
@@ -38,6 +43,13 @@ pub async fn handle_count(
             }
         }
     };
+    if support_only {
+        conn.send(RelayMessage::closed(
+            &sub_id,
+            "restricted: COUNT is unavailable to support-only grants",
+        ));
+        return;
+    }
 
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.
