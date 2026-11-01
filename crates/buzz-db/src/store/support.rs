@@ -51,11 +51,17 @@ pub async fn consume_nonce(
     nonce_hash: &[u8; 32],
     expires_at: DateTime<Utc>,
 ) -> Result<bool> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     sqlx::query(
         "DELETE FROM support_admission_nonces WHERE community_id = $1 AND expires_at <= now()",
     )
     .bind(community.as_uuid())
-    .execute(pool)
+    .execute(tx.conn())
     .await?;
     let result = sqlx::query(
         "INSERT INTO support_admission_nonces (community_id, nonce_hash, expires_at) \
@@ -64,14 +70,16 @@ pub async fn consume_nonce(
     .bind(community.as_uuid())
     .bind(nonce_hash.as_slice())
     .bind(expires_at)
-    .execute(pool)
+    .execute(tx.conn())
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() == 1)
 }
 
 /// Insert or refresh one support grant without creating relay membership.
 ///
 /// The caller must provide the canonical three-party DM created by `dm::create_dm`.
+#[allow(clippy::too_many_arguments)]
 pub async fn admit(
     pool: &PgPool,
     community: CommunityId,
@@ -102,7 +110,18 @@ pub async fn admit(
             "invalid support capability generation".into(),
         ));
     }
+    if expires_at <= Utc::now() {
+        return Err(DbError::InvalidData(
+            "support grant expiry must be in the future".into(),
+        ));
+    }
 
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let row = sqlx::query(
         r#"
         INSERT INTO support_grants (
@@ -115,8 +134,8 @@ pub async fn admit(
             escalation_pubkey = EXCLUDED.escalation_pubkey,
             capability_generation = EXCLUDED.capability_generation,
             expires_at = GREATEST(support_grants.expires_at, EXCLUDED.expires_at),
-            revoked_at = NULL,
             updated_at = now()
+        WHERE support_grants.revoked_at IS NULL
         RETURNING subject_pubkey, channel_id, support_pubkey, escalation_pubkey,
                   capability_generation, expires_at, (xmax = 0) AS inserted
         "#,
@@ -128,13 +147,13 @@ pub async fn admit(
     .bind(escalation_pubkey)
     .bind(capability_generation)
     .bind(expires_at)
-    .fetch_one(pool)
-    .await?;
+    .fetch_optional(tx.conn())
+    .await?
+    .ok_or_else(|| DbError::AccessDenied("support grant is durably revoked".into()))?;
     let changed: bool = row.try_get("inserted")?;
-    Ok(SupportAdmission {
-        grant: grant_from_row(row)?,
-        changed,
-    })
+    let grant = grant_from_row(row)?;
+    tx.commit().await?;
+    Ok(SupportAdmission { grant, changed })
 }
 
 /// Load an unexpired, unrevoked grant from the writer.
@@ -179,14 +198,21 @@ pub async fn active_grant(
 
 /// Revoke one customer's support grant.
 pub async fn revoke(pool: &PgPool, community: CommunityId, subject_pubkey: &[u8]) -> Result<bool> {
+    let mut tx = crate::begin_community_write_transaction(
+        pool,
+        community,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
     let result = sqlx::query(
         "UPDATE support_grants SET revoked_at = now(), updated_at = now() \
          WHERE community_id = $1 AND subject_pubkey = $2 AND revoked_at IS NULL",
     )
     .bind(community.as_uuid())
     .bind(subject_pubkey)
-    .execute(pool)
+    .execute(tx.conn())
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() == 1)
 }
 
@@ -242,5 +268,92 @@ impl Db {
         subject_pubkey: &[u8],
     ) -> Result<bool> {
         revoke(&self.pool, community, subject_pubkey).await
+    }
+}
+
+#[cfg(test)]
+mod postgres_tests {
+    use super::*;
+    use crate::test_support::admission_fixture;
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn support_grants_are_non_membership_replay_safe_and_durably_revoked() {
+        let (db, communities) = admission_fixture().await;
+        let community = communities[0];
+        let customer = [1_u8; 32];
+        let support = [2_u8; 32];
+        let escalation = [3_u8; 32];
+        let participants: [&[u8]; 3] = [&customer, &support, &escalation];
+        let channel = crate::dm::create_dm(&db.pool, community, &participants, &support)
+            .await
+            .expect("support dm");
+
+        let nonce = [9_u8; 32];
+        let nonce_expiry = Utc::now() + chrono::TimeDelta::minutes(2);
+        assert!(consume_nonce(&db.pool, community, &nonce, nonce_expiry)
+            .await
+            .expect("first nonce"));
+        assert!(!consume_nonce(&db.pool, community, &nonce, nonce_expiry)
+            .await
+            .expect("replayed nonce"));
+
+        let grant_expiry = Utc::now() + chrono::TimeDelta::days(30);
+        let admitted = admit(
+            &db.pool,
+            community,
+            &customer,
+            channel.id,
+            &support,
+            &escalation,
+            "g1",
+            grant_expiry,
+        )
+        .await
+        .expect("admit");
+        assert_eq!(admitted.grant.expires_at, grant_expiry);
+        assert!(active_grant(&db.pool, community, &customer)
+            .await
+            .expect("active grant")
+            .is_some());
+
+        let membership_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM relay_members WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(hex::encode(customer))
+        .fetch_one(&db.pool)
+        .await
+        .expect("membership count");
+        assert_eq!(membership_count, 0);
+        let policy_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM join_policy_acceptances WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(hex::encode(customer))
+        .fetch_one(&db.pool)
+        .await
+        .expect("policy count");
+        assert_eq!(policy_count, 0);
+
+        assert!(revoke(&db.pool, community, &customer)
+            .await
+            .expect("revoke"));
+        assert!(active_grant(&db.pool, community, &customer)
+            .await
+            .expect("revoked grant")
+            .is_none());
+        let readmit = admit(
+            &db.pool,
+            community,
+            &customer,
+            channel.id,
+            &support,
+            &escalation,
+            "g2",
+            Utc::now() + chrono::TimeDelta::days(30),
+        )
+        .await;
+        assert!(matches!(readmit, Err(DbError::AccessDenied(_))));
     }
 }

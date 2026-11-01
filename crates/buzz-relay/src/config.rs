@@ -101,6 +101,8 @@ pub struct SupportCapabilityConfig {
 /// Server-managed support-only admission configuration.
 #[derive(Debug, Clone)]
 pub struct SupportAdmissionConfig {
+    /// Exact canonical community host authorized for this capability plane.
+    pub community_host: String,
     /// Trails/Hermes support participant.
     pub support_pubkey: nostr::PublicKey,
     /// JP participant and sole permitted escalation target.
@@ -685,6 +687,8 @@ fn inert_env_vars<'a>(names: &[&'a str], lookup: impl Fn(&str) -> Option<String>
 }
 
 fn support_admission_from_env() -> Result<Option<SupportAdmissionConfig>, ConfigError> {
+    const SUPPORT_COMMUNITY_HOST: &str = "buzz.anmore.space";
+    const MAX_CAPABILITY_LIFETIME_SECS: i64 = 24 * 60 * 60;
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RawCapability {
@@ -697,6 +701,7 @@ fn support_admission_from_env() -> Result<Option<SupportAdmissionConfig>, Config
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RawSupportConfig {
+        community_host: String,
         support_pubkey: String,
         escalation_pubkey: String,
         #[serde(default = "default_grant_ttl")]
@@ -719,6 +724,11 @@ fn support_admission_from_env() -> Result<Option<SupportAdmissionConfig>, Config
     let parsed: RawSupportConfig = serde_json::from_str(&raw).map_err(|error| {
         ConfigError::InvalidValue(format!("invalid BUZZ_SUPPORT_ADMISSION_JSON: {error}"))
     })?;
+    if parsed.community_host != SUPPORT_COMMUNITY_HOST {
+        return Err(ConfigError::InvalidValue(format!(
+            "support community_host must be exactly {SUPPORT_COMMUNITY_HOST}"
+        )));
+    }
     fn exact_lower_hex_pubkey(value: &str) -> bool {
         value.len() == 64
             && value
@@ -759,7 +769,9 @@ fn support_admission_from_env() -> Result<Option<SupportAdmissionConfig>, Config
         ));
     }
     let mut generations = std::collections::HashSet::new();
+    let mut capability_hashes = std::collections::HashSet::new();
     let mut capabilities = Vec::with_capacity(parsed.capabilities.len());
+    let now = chrono::Utc::now().timestamp();
     for capability in parsed.capabilities {
         if capability.generation.is_empty()
             || capability.generation.len() > 128
@@ -774,14 +786,29 @@ fn support_admission_from_env() -> Result<Option<SupportAdmissionConfig>, Config
                 "support capabilities must contain 32..=512 bytes".into(),
             ));
         }
+        if !capability.revoked
+            && (capability.expires_at <= now
+                || capability.expires_at > now + MAX_CAPABILITY_LIFETIME_SECS)
+        {
+            return Err(ConfigError::InvalidValue(
+                "active support capabilities must expire in the next 24 hours".into(),
+            ));
+        }
+        let capability_hash: [u8; 32] = Sha256::digest(capability.capability.as_bytes()).into();
+        if !capability_hashes.insert(capability_hash) {
+            return Err(ConfigError::InvalidValue(
+                "support capability hashes must be unique".into(),
+            ));
+        }
         capabilities.push(SupportCapabilityConfig {
             generation: capability.generation,
-            capability_hash: Sha256::digest(capability.capability.as_bytes()).into(),
+            capability_hash,
             expires_at: capability.expires_at,
             revoked: capability.revoked,
         });
     }
     Ok(Some(SupportAdmissionConfig {
+        community_host: parsed.community_host,
         support_pubkey,
         escalation_pubkey,
         grant_ttl_secs: parsed.grant_ttl_secs,
@@ -1548,6 +1575,15 @@ impl Config {
 
         let nip_fi = crate::nip_fi_config::NipFiRelayConfig::from_env()?;
         let support_admission = support_admission_from_env()?;
+        if let Some(support) = &support_admission {
+            let relay_authority = buzz_core::tenant::relay_url_authority(&relay_url);
+            if relay_url != "wss://buzz.anmore.space" || relay_authority != support.community_host {
+                return Err(ConfigError::InvalidValue(format!(
+                    "support admission requires RELAY_URL=wss://{}",
+                    support.community_host,
+                )));
+            }
+        }
         let nip_fi_provision_binding = crate::nip_fi_config::parse_provision_binding()?;
         let nip_fi_resolver_bounds =
             crate::nip_fi_resolver::ResolverBounds::from_env(db_pool_size)?;
@@ -3113,6 +3149,67 @@ mod tests {
         let config = Config::from_env().expect("config");
         std::env::remove_var("BUZZ_MAX_FRAME_BYTES");
         assert_eq!(config.max_frame_bytes, 262_144);
+    }
+
+    #[test]
+    fn support_config_is_host_bound_unique_and_short_lived() {
+        let _guards = env_guards();
+        let now = chrono::Utc::now().timestamp();
+        let base = serde_json::json!({
+            "community_host": "buzz.anmore.space",
+            "support_pubkey": "11".repeat(32),
+            "escalation_pubkey": "22".repeat(32),
+            "grant_ttl_secs": 30 * 24 * 60 * 60,
+            "capabilities": [{
+                "generation": "g1",
+                "capability": "a".repeat(32),
+                "expires_at": now + 3600,
+                "revoked": false
+            }]
+        });
+
+        std::env::set_var("BUZZ_SUPPORT_ADMISSION_JSON", base.to_string());
+        let parsed = support_admission_from_env().expect("valid support config");
+        assert_eq!(
+            parsed.as_ref().map(|config| config.community_host.as_str()),
+            Some("buzz.anmore.space")
+        );
+
+        let mut wrong_host = base.clone();
+        wrong_host["community_host"] = serde_json::json!("alias.anmore.space");
+        std::env::set_var("BUZZ_SUPPORT_ADMISSION_JSON", wrong_host.to_string());
+        assert!(matches!(
+            support_admission_from_env(),
+            Err(ConfigError::InvalidValue(message)) if message.contains("community_host")
+        ));
+
+        let mut duplicate = base.clone();
+        duplicate["capabilities"] = serde_json::json!([
+            {
+                "generation": "g1",
+                "capability": "a".repeat(32),
+                "expires_at": now + 3600
+            },
+            {
+                "generation": "g2",
+                "capability": "a".repeat(32),
+                "expires_at": now + 3600
+            }
+        ]);
+        std::env::set_var("BUZZ_SUPPORT_ADMISSION_JSON", duplicate.to_string());
+        assert!(matches!(
+            support_admission_from_env(),
+            Err(ConfigError::InvalidValue(message)) if message.contains("hashes must be unique")
+        ));
+
+        let mut too_long = base;
+        too_long["capabilities"][0]["expires_at"] = serde_json::json!(now + 24 * 60 * 60 + 1);
+        std::env::set_var("BUZZ_SUPPORT_ADMISSION_JSON", too_long.to_string());
+        assert!(matches!(
+            support_admission_from_env(),
+            Err(ConfigError::InvalidValue(message)) if message.contains("next 24 hours")
+        ));
+        std::env::remove_var("BUZZ_SUPPORT_ADMISSION_JSON");
     }
 
     #[test]

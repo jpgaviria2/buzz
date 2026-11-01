@@ -450,7 +450,8 @@ participants.
 
 `support_admission_nonces` is the durable, community-scoped replay set for the
 required NIP-98 `nonce` tag. Only SHA-256 nonce hashes are stored. Both tables are
-covered by the community write fence and migration `0080_support_admission.sql`.
+written through application-level community admission and migration
+`0080_support_admission.sql`; they deliberately add no foreign keys or triggers.
 
 ## Review checklist
 

@@ -558,12 +558,11 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             let support_grant =
                 crate::api::support::active_grant(&state, conn.tenant.community(), &pubkey).await;
 
-            // Pubkey allowlist gate — only for pubkey-only auth. An active
-            // support-only grant is a separate admission authority and bypasses
-            // this community-membership allowlist without creating membership.
+            let mut support_is_admission_authority = false;
+            // Pubkey allowlist gate — only for pubkey-only auth. A support grant
+            // may replace a failed ordinary gate, but must then remain scoped.
             if state.config.pubkey_allowlist_enabled
                 && auth_ctx.auth_method == buzz_auth::AuthMethod::Nip42
-                && !matches!(&support_grant, Ok(Some(_)))
             {
                 let allowlist = state
                     .db
@@ -575,6 +574,9 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
                 match classify_allowlist(allowlist) {
                     PolicyCheck::Allowed(()) => {}
+                    PolicyCheck::Denied if matches!(&support_grant, Ok(Some(_))) => {
+                        support_is_admission_authority = true;
+                    }
                     PolicyCheck::Denied => {
                         warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "pubkey not in allowlist");
                         metrics::counter!("buzz_auth_failures_total", "reason" => "allowlist_denied")
@@ -639,9 +641,11 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 PolicyCheck::Allowed(owner) => owner,
                 PolicyCheck::Denied => {
                     if let Ok(Some(grant)) = support_grant {
+                        support_is_admission_authority = true;
                         auth_ctx.scopes = vec![
                             buzz_auth::Scope::MessagesRead,
                             buzz_auth::Scope::MessagesWrite,
+                            buzz_auth::Scope::Unknown("support:dm".into()),
                         ];
                         auth_ctx.channel_ids = Some(vec![grant.channel_id]);
                         None
@@ -684,6 +688,40 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     return;
                 }
             };
+
+            if support_is_admission_authority {
+                let grant = match crate::api::support::active_grant(
+                    &state,
+                    conn.tenant.community(),
+                    &pubkey,
+                )
+                .await
+                {
+                    Ok(Some(grant)) => grant,
+                    _ => {
+                        conn.send(RelayMessage::ok(
+                            &event_id_hex,
+                            false,
+                            "restricted: support grant expired or revoked",
+                        ));
+                        return;
+                    }
+                };
+                auth_ctx.scopes = vec![
+                    buzz_auth::Scope::MessagesRead,
+                    buzz_auth::Scope::MessagesWrite,
+                    buzz_auth::Scope::Unknown("support:dm".into()),
+                ];
+                auth_ctx.channel_ids = Some(vec![grant.channel_id]);
+                let cancel = conn.cancel.clone();
+                tokio::spawn(async move {
+                    let wait = (grant.expires_at - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    tokio::time::sleep(wait).await;
+                    cancel.cancel();
+                });
+            }
 
             // Open relay NIP-OA backfill: extract owner for agent→owner DB mapping
             // (needed for observer frame auth). Only runs on open relays — on closed

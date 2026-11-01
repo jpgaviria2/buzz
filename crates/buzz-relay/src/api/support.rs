@@ -23,6 +23,7 @@ use super::{api_error, bridge, internal_error};
 const ADMISSION_RATE_LIMIT: u32 = 5;
 const RATE_CACHE_CAPACITY: u64 = 20_000;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+const MESSAGE_BURST_WINDOW: Duration = Duration::from_secs(5);
 const NONCE_MAX_BYTES: usize = 128;
 const NONCE_MIN_BYTES: usize = 16;
 const NONCE_REPLAY_TTL_SECS: i64 = 120;
@@ -38,6 +39,13 @@ static DM_CREATE_RATE_LIMITER: LazyLock<moka::sync::Cache<String, Arc<AtomicU32>
         moka::sync::Cache::builder()
             .max_capacity(RATE_CACHE_CAPACITY)
             .time_to_live(Duration::from_secs(60 * 60))
+            .build()
+    });
+static MESSAGE_BURST_LIMITER: LazyLock<moka::sync::Cache<String, Arc<AtomicU32>>> =
+    LazyLock::new(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(RATE_CACHE_CAPACITY)
+            .time_to_live(MESSAGE_BURST_WINDOW)
             .build()
     });
 
@@ -71,10 +79,12 @@ pub(crate) fn message_rate_limited(
     community: buzz_core::CommunityId,
     pubkey: &nostr::PublicKey,
 ) -> bool {
-    rate_limited_at(
-        rate_key(community, &format!("message:{}", pubkey.to_hex())),
-        30,
-    )
+    let suffix = format!("message:{}", pubkey.to_hex());
+    let burst = MESSAGE_BURST_LIMITER
+        .get_with(rate_key(community, &suffix), || Arc::new(AtomicU32::new(0)));
+    let burst_limited = burst.fetch_add(1, Ordering::Relaxed) >= 10;
+    let sustained_limited = rate_limited_at(rate_key(community, &suffix), 30);
+    burst_limited || sustained_limited
 }
 
 fn capability_match<'a>(
@@ -177,6 +187,10 @@ async fn admit_checked(
             .into_response()
         }
     };
+    if tenant.host() != config.community_host {
+        return api_error(StatusCode::NOT_FOUND, "support_admission_not_configured")
+            .into_response();
+    }
     if let Some(ip) = remote_ip {
         if rate_limited(rate_key(tenant.community(), &format!("ip:{ip}"))) {
             return api_error(
@@ -252,7 +266,7 @@ async fn admit_checked(
         &state,
         tenant.community(),
         &verified.pubkey,
-        true,
+        false,
     )
     .await
     {
@@ -292,7 +306,10 @@ async fn admit_checked(
         .into_response();
     }
     let channel = match existing_dm {
-        Some(channel) => channel,
+        Some(channel) if channel.archived_at.is_none() => channel,
+        Some(_) => {
+            return api_error(StatusCode::CONFLICT, "support_dm_unavailable").into_response()
+        }
         None => match state
             .db
             .create_dm(tenant.community(), &participants, &support)
@@ -302,11 +319,11 @@ async fn admit_checked(
             Err(error) => return internal_error(&format!("support DM: {error}")).into_response(),
         },
     };
+    if channel.archived_at.is_some() || channel.deleted_at.is_some() {
+        return api_error(StatusCode::CONFLICT, "support_dm_unavailable").into_response();
+    }
     let grant_expires_at =
         Utc::now() + TimeDelta::seconds(i64::try_from(config.grant_ttl_secs).unwrap_or(i64::MAX));
-    let grant_expires_at = grant_expires_at.min(
-        chrono::DateTime::from_timestamp(capability.expires_at, 0).unwrap_or(grant_expires_at),
-    );
     let admission = match state
         .db
         .admit_support(
@@ -351,17 +368,57 @@ pub(crate) async fn active_grant(
     community: buzz_core::CommunityId,
     pubkey: &nostr::PublicKey,
 ) -> Result<Option<buzz_db::SupportGrant>, buzz_db::DbError> {
-    state
+    let grant = state
         .db
         .active_support_grant(community, pubkey.as_bytes())
-        .await
+        .await?;
+    let Some(grant) = grant else {
+        return Ok(None);
+    };
+    let Some(config) = state.config.support_admission.as_ref() else {
+        return Ok(None);
+    };
+    if !grant_matches_config(&grant, config) {
+        return Ok(None);
+    }
+    Ok(Some(grant))
+}
+
+fn grant_matches_config(grant: &buzz_db::SupportGrant, config: &SupportAdmissionConfig) -> bool {
+    config.capabilities.iter().any(|capability| {
+        capability.generation == grant.capability_generation && !capability.revoked
+    }) && grant.support_pubkey == config.support_pubkey.to_bytes()
+        && grant.escalation_pubkey == config.escalation_pubkey.to_bytes()
+}
+
+/// Durable customer revocation plus immediate cluster-wide socket disconnect.
+pub async fn revoke_grant(
+    state: &AppState,
+    tenant: &buzz_core::TenantContext,
+    pubkey: &nostr::PublicKey,
+) -> Result<bool, buzz_db::DbError> {
+    let revoked = state
+        .db
+        .revoke_support_grant(tenant.community(), pubkey.as_bytes())
+        .await?;
+    if revoked {
+        state.disconnect_pubkey_clusterwide(
+            tenant,
+            pubkey.as_bytes(),
+            &"0".repeat(64),
+            "restricted: support grant revoked",
+        );
+    }
+    Ok(revoked)
 }
 
 /// Whether a NIP-42 context was restricted by the support-only admission path.
 pub(crate) fn is_support_only_context(ctx: &buzz_auth::AuthContext) -> bool {
     ctx.auth_method == buzz_auth::AuthMethod::Nip42
         && ctx.channel_ids.as_ref().is_some_and(|ids| ids.len() == 1)
-        && ctx.scopes.len() == 2
+        && ctx
+            .scopes
+            .contains(&buzz_auth::Scope::Unknown("support:dm".into()))
         && ctx.scopes.contains(&buzz_auth::Scope::MessagesRead)
         && ctx.scopes.contains(&buzz_auth::Scope::MessagesWrite)
 }
@@ -450,6 +507,7 @@ mod tests {
 
     fn config(capability: &str, expires_at: i64, revoked: bool) -> SupportAdmissionConfig {
         SupportAdmissionConfig {
+            community_host: "buzz.anmore.space".into(),
             support_pubkey: Keys::generate().public_key(),
             escalation_pubkey: Keys::generate().public_key(),
             grant_ttl_secs: 60,
@@ -500,6 +558,87 @@ mod tests {
             assert!(!dm_creation_rate_limited(community, &pubkey));
         }
         assert!(dm_creation_rate_limited(community, &pubkey));
+
+        let message_pubkey = Keys::generate().public_key();
+        for _ in 0..10 {
+            assert!(!message_rate_limited(community, &message_pubkey));
+        }
+        assert!(message_rate_limited(community, &message_pubkey));
+    }
+
+    #[tokio::test]
+    async fn endpoint_returns_strict_json_when_support_is_unconfigured() {
+        let state = crate::state::tests::test_state().await;
+        let response = admit_checked(
+            state,
+            None,
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({"error": "support_admission_not_configured"})
+        );
+    }
+
+    #[test]
+    fn support_context_requires_the_internal_marker() {
+        let channel = uuid::Uuid::new_v4();
+        let mut context = buzz_auth::AuthContext {
+            pubkey: Keys::generate().public_key(),
+            scopes: vec![
+                buzz_auth::Scope::MessagesRead,
+                buzz_auth::Scope::MessagesWrite,
+            ],
+            channel_ids: Some(vec![channel]),
+            auth_method: buzz_auth::AuthMethod::Nip42,
+            agent_owner_pubkey: None,
+        };
+        assert!(!is_support_only_context(&context));
+        context
+            .scopes
+            .push(buzz_auth::Scope::Unknown("support:dm".into()));
+        assert!(is_support_only_context(&context));
+    }
+
+    #[test]
+    fn generation_removal_revocation_and_participant_rotation_kill_grants() {
+        let customer = Keys::generate();
+        let escalation = Keys::generate();
+        let grant = grant(&customer, &escalation);
+        let mut matching = SupportAdmissionConfig {
+            community_host: "buzz.anmore.space".into(),
+            support_pubkey: nostr::PublicKey::from_slice(&grant.support_pubkey).expect("support"),
+            escalation_pubkey: escalation.public_key(),
+            grant_ttl_secs: 30 * 24 * 60 * 60,
+            capabilities: vec![SupportCapabilityConfig {
+                generation: grant.capability_generation.clone(),
+                capability_hash: [7; 32],
+                expires_at: Utc::now().timestamp() - 1,
+                revoked: false,
+            }],
+        };
+        assert!(
+            grant_matches_config(&grant, &matching),
+            "capability expiry alone must not shorten the independent grant TTL"
+        );
+        matching.capabilities[0].revoked = true;
+        assert!(!grant_matches_config(&grant, &matching));
+        matching.capabilities.clear();
+        assert!(!grant_matches_config(&grant, &matching));
+        matching.capabilities.push(SupportCapabilityConfig {
+            generation: grant.capability_generation.clone(),
+            capability_hash: [8; 32],
+            expires_at: Utc::now().timestamp() + 60,
+            revoked: false,
+        });
+        matching.support_pubkey = Keys::generate().public_key();
+        assert!(!grant_matches_config(&grant, &matching));
     }
 
     #[test]

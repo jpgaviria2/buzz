@@ -1,7 +1,9 @@
 -- Support-only admission grants. These rows deliberately do not reference or
 -- populate relay_members: a support grant authorizes exactly one restricted DM.
+SET LOCAL lock_timeout = '5s';
+
 CREATE TABLE support_grants (
-    community_id UUID NOT NULL REFERENCES communities(id),
+    community_id UUID NOT NULL,
     subject_pubkey BYTEA NOT NULL,
     channel_id UUID NOT NULL,
     support_pubkey BYTEA NOT NULL,
@@ -12,8 +14,6 @@ CREATE TABLE support_grants (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (community_id, subject_pubkey),
-    FOREIGN KEY (community_id, channel_id)
-        REFERENCES channels (community_id, id) ON DELETE CASCADE,
     CONSTRAINT chk_support_grants_subject_len CHECK (length(subject_pubkey) = 32),
     CONSTRAINT chk_support_grants_support_len CHECK (length(support_pubkey) = 32),
     CONSTRAINT chk_support_grants_escalation_len CHECK (length(escalation_pubkey) = 32),
@@ -32,7 +32,7 @@ CREATE INDEX idx_support_grants_channel
 -- Durable, tenant-scoped nonce consumption. The unique key makes concurrent
 -- replay checks atomic across pods and process restarts.
 CREATE TABLE support_admission_nonces (
-    community_id UUID NOT NULL REFERENCES communities(id),
+    community_id UUID NOT NULL,
     nonce_hash BYTEA NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -41,7 +41,3 @@ CREATE TABLE support_admission_nonces (
 );
 CREATE INDEX idx_support_admission_nonces_expiry
     ON support_admission_nonces (community_id, expires_at);
-
--- Community deletion and archival fences were introduced in migration 0029.
-SELECT attach_community_write_fence('support_grants');
-SELECT attach_community_write_fence('support_admission_nonces');

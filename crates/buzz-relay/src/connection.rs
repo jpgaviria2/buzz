@@ -1328,6 +1328,15 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
         }
     };
 
+    if matches!(conn.auth_state_snapshot(), AuthState::Authenticated(ref ctx) if crate::api::support::is_support_only_context(ctx))
+        && !support_protocol_allowed(&msg)
+    {
+        conn.send(RelayMessage::notice(
+            "restricted: support sessions accept only REQ and EVENT",
+        ));
+        return;
+    }
+
     if !enforce_ws_admission(&msg, &conn, &state).await {
         return;
     }
@@ -1459,6 +1468,10 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
     }
 }
 
+fn support_protocol_allowed(message: &ClientMessage) -> bool {
+    matches!(message, ClientMessage::Req { .. } | ClientMessage::Event(_))
+}
+
 #[cfg(test)]
 pub(crate) mod test_seam {
     use super::*;
@@ -1493,6 +1506,27 @@ pub(crate) mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    #[test]
+    fn support_protocol_rejects_artifact_sync_count_and_close() {
+        let channel = Uuid::new_v4();
+        let sync = ClientMessage::parse(&format!(
+            r##"["REQ","s",{{"artifact":"current","#h":["{channel}"]}}]"##
+        ))
+        .expect("artifact sync");
+        assert!(matches!(sync, ClientMessage::ArtifactSync { .. }));
+        assert!(!support_protocol_allowed(&sync));
+        assert!(!support_protocol_allowed(
+            &ClientMessage::parse(r#"["COUNT","c",{"kinds":[9]}]"#).expect("count")
+        ));
+        assert!(!support_protocol_allowed(&ClientMessage::Close("s".into())));
+
+        let req = ClientMessage::parse(&format!(
+            r##"["REQ","s",{{"kinds":[9],"#h":["{channel}"]}}]"##
+        ))
+        .expect("req");
+        assert!(support_protocol_allowed(&req));
+    }
 
     /// A test connection together with the receiving end of each outbound queue.
     pub(crate) struct TestConn {

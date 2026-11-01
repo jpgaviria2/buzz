@@ -1,7 +1,7 @@
 -- ── Support-only grants ──────────────────────────────────────────────────────
 -- Separate from relay_members: authorizes exactly one three-party support DM.
 CREATE TABLE support_grants (
-    community_id UUID NOT NULL REFERENCES communities(id),
+    community_id UUID NOT NULL,
     subject_pubkey BYTEA NOT NULL,
     channel_id UUID NOT NULL,
     support_pubkey BYTEA NOT NULL,
@@ -12,8 +12,6 @@ CREATE TABLE support_grants (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (community_id, subject_pubkey),
-    FOREIGN KEY (community_id, channel_id)
-        REFERENCES channels (community_id, id) ON DELETE CASCADE,
     CONSTRAINT chk_support_grants_subject_len CHECK (length(subject_pubkey) = 32),
     CONSTRAINT chk_support_grants_support_len CHECK (length(support_pubkey) = 32),
     CONSTRAINT chk_support_grants_escalation_len CHECK (length(escalation_pubkey) = 32),

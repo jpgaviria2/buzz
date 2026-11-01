@@ -1,6 +1,6 @@
 -- Durable, tenant-scoped support NIP-98 nonce replay guard.
 CREATE TABLE support_admission_nonces (
-    community_id UUID NOT NULL REFERENCES communities(id),
+    community_id UUID NOT NULL,
     nonce_hash BYTEA NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

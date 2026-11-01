@@ -9,6 +9,7 @@ Set `BUZZ_SUPPORT_ADMISSION_JSON` to strict JSON:
 
 ```json
 {
+  "community_host": "buzz.anmore.space",
   "support_pubkey": "<64-char-lowercase-hex>",
   "escalation_pubkey": "<64-char-lowercase-hex>",
   "grant_ttl_secs": 2592000,
@@ -23,12 +24,17 @@ Set `BUZZ_SUPPORT_ADMISSION_JSON` to strict JSON:
 }
 ```
 
-One to eight generations may be configured. To rotate, deploy the new generation
+The support plane is accepted only on the exact canonical host
+`buzz.anmore.space`; aliases and other tenant hosts return not found. One to
+eight generations may be configured. Active capabilities must expire in the
+next 24 hours, and both generation identifiers and capability hashes must be
+unique. To rotate, deploy the new generation
 alongside the old one, update clients, then set the old generation's `revoked`
 field to `true` (or remove it) and reload the relay configuration. Raw capability
 values are SHA-256 hashed while configuration is loaded and are not logged.
-Existing grants retain their own bounded expiry; capability revocation prevents
-new admissions through that generation.
+Customer grants retain their independent configured expiry (30 days by default),
+but capability generation revocation or removal invalidates every active grant
+issued by that generation.
 
 ## API
 
@@ -76,10 +82,15 @@ Reads are limited to kind 9 in the exact DM and kind 0 profiles for the exact
 three participants. Writes must be customer-authored kind 9 events with exactly
 one two-element `h` tag for the granted channel. They may have no `p` tag or one
 exact two-element `p` tag for the escalation pubkey. Grant expiry, revocation,
-and the exact active three-person DM roster are rechecked on NIP-42 admission,
-REQ, and EVENT.
+generation status, and the exact active three-person DM roster are rechecked on
+NIP-42 admission, REQ, and EVENT. Support sockets are cancelled at the grant
+deadline, so live subscriptions cannot continue after expiry. Support sessions
+accept only REQ and EVENT frames; COUNT, artifact sync, AUTH, and CLOSE are
+refused after support authentication.
 
 To revoke one customer grant, call the database-layer
 `Db::revoke_support_grant` operation from an operator workflow. The next support
-AUTH, REQ, or EVENT fails closed. Ordinary relay membership and join-policy
-handling are unchanged.
+AUTH, REQ, or EVENT fails closed. Relay callers should use
+`api::support::revoke_grant`, which also broadcasts a cluster-wide disconnect for
+the customer's active sockets. Ordinary relay membership and join-policy handling
+are unchanged.
