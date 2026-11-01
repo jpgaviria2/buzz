@@ -122,9 +122,7 @@ pub async fn handle_req(
     let mut support_channel_id = None;
     if support_only {
         let grant =
-            match crate::api::support::active_grant(&state, conn.tenant.community(), &auth_pubkey)
-                .await
-            {
+            match crate::api::support::active_grant(&state, &conn.tenant, &auth_pubkey).await {
                 Ok(Some(grant)) => grant,
                 Ok(None) => {
                     super::close::refuse(

@@ -365,23 +365,52 @@ async fn admit_checked(
 /// Reload a grant for an already authenticated support-only principal.
 pub(crate) async fn active_grant(
     state: &AppState,
-    community: buzz_core::CommunityId,
+    tenant: &buzz_core::TenantContext,
     pubkey: &nostr::PublicKey,
 ) -> Result<Option<buzz_db::SupportGrant>, buzz_db::DbError> {
-    let grant = state
-        .db
-        .active_support_grant(community, pubkey.as_bytes())
-        .await?;
-    let Some(grant) = grant else {
+    active_grant_for_host(state, tenant.community(), tenant.host(), pubkey.as_bytes()).await
+}
+
+pub(crate) async fn active_grant_for_delivery(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    host: &str,
+    pubkey: &[u8],
+) -> Result<Option<buzz_db::SupportGrant>, buzz_db::DbError> {
+    active_grant_for_host(state, community, host, pubkey).await
+}
+
+async fn active_grant_for_host(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    host: &str,
+    pubkey: &[u8],
+) -> Result<Option<buzz_db::SupportGrant>, buzz_db::DbError> {
+    let Some(config) = state.config.support_admission.as_ref() else {
         return Ok(None);
     };
-    let Some(config) = state.config.support_admission.as_ref() else {
+    if !support_host_authorized(config, host) {
+        return Ok(None);
+    }
+    let grant = state.db.active_support_grant(community, pubkey).await?;
+    let Some(grant) = grant else {
         return Ok(None);
     };
     if !grant_matches_config(&grant, config) {
         return Ok(None);
     }
     Ok(Some(grant))
+}
+
+pub(crate) fn support_host_authorized(config: &SupportAdmissionConfig, host: &str) -> bool {
+    host == config.community_host
+}
+
+pub(crate) fn support_delivery_authorized(
+    grant: Option<&buzz_db::SupportGrant>,
+    channel_id: Option<uuid::Uuid>,
+) -> bool {
+    grant.is_some_and(|grant| channel_id.is_none_or(|channel_id| channel_id == grant.channel_id))
 }
 
 fn grant_matches_config(grant: &buzz_db::SupportGrant, config: &SupportAdmissionConfig) -> bool {
@@ -639,6 +668,35 @@ mod tests {
         });
         matching.support_pubkey = Keys::generate().public_key();
         assert!(!grant_matches_config(&grant, &matching));
+    }
+
+    #[test]
+    fn delivery_requires_a_current_grant_for_the_exact_channel() {
+        let customer = Keys::generate();
+        let escalation = Keys::generate();
+        let grant = grant(&customer, &escalation);
+        assert!(support_delivery_authorized(Some(&grant), None));
+        assert!(support_delivery_authorized(
+            Some(&grant),
+            Some(grant.channel_id)
+        ));
+        assert!(!support_delivery_authorized(None, Some(grant.channel_id)));
+        assert!(!support_delivery_authorized(
+            Some(&grant),
+            Some(uuid::Uuid::new_v4())
+        ));
+    }
+
+    #[test]
+    fn support_authority_rejects_hosts_that_only_alias_the_same_tenant() {
+        let config = config(
+            "a-very-long-public-support-capability",
+            Utc::now().timestamp() + 60,
+            false,
+        );
+        assert!(support_host_authorized(&config, "buzz.anmore.space"));
+        assert!(!support_host_authorized(&config, "alias.anmore.space"));
+        assert!(!support_host_authorized(&config, "buzz.anmore.space:443"));
     }
 
     #[test]

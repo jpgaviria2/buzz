@@ -444,9 +444,13 @@ misinterpret them.
 Support customers are represented by `support_grants`, never by `relay_members`.
 Each tenant-scoped grant binds one customer pubkey to one private DM and the exact
 configured support and escalation pubkeys. `revoked_at` and `expires_at` are
-checked on NIP-42 admission and every support read/write authorization. Active
-grant lookup also verifies that the DM roster still contains exactly those three
-participants.
+checked on NIP-42 admission, every support read/write authorization, and live
+delivery to an existing support subscription. Active grant lookup also verifies
+that the configured generation remains present and unrevoked, the connection uses
+the exact canonical support host, and the DM roster still contains exactly those
+three participants. Capability expiry blocks new admissions but does not invalidate
+an independently unexpired grant, so expired generation records remain loadable
+across relay restarts.
 
 `support_admission_nonces` is the durable, community-scoped replay set for the
 required NIP-98 `nonce` tag. Only SHA-256 nonce hashes are stored. Both tables are

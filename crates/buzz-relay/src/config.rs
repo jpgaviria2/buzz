@@ -786,12 +786,10 @@ fn support_admission_from_env() -> Result<Option<SupportAdmissionConfig>, Config
                 "support capabilities must contain 32..=512 bytes".into(),
             ));
         }
-        if !capability.revoked
-            && (capability.expires_at <= now
-                || capability.expires_at > now + MAX_CAPABILITY_LIFETIME_SECS)
+        if capability.expires_at <= 0 || capability.expires_at > now + MAX_CAPABILITY_LIFETIME_SECS
         {
             return Err(ConfigError::InvalidValue(
-                "active support capabilities must expire in the next 24 hours".into(),
+                "support capability expires_at must be positive and no more than 24 hours in the future".into(),
             ));
         }
         let capability_hash: [u8; 32] = Sha256::digest(capability.capability.as_bytes()).into();
@@ -3202,12 +3200,26 @@ mod tests {
             Err(ConfigError::InvalidValue(message)) if message.contains("hashes must be unique")
         ));
 
+        let mut expired = base.clone();
+        expired["capabilities"][0]["expires_at"] = serde_json::json!(now - 3600);
+        std::env::set_var("BUZZ_SUPPORT_ADMISSION_JSON", expired.to_string());
+        let parsed = support_admission_from_env().expect("expired generations remain configured");
+        assert!(parsed.is_some());
+
+        let mut non_positive = base.clone();
+        non_positive["capabilities"][0]["expires_at"] = serde_json::json!(0);
+        std::env::set_var("BUZZ_SUPPORT_ADMISSION_JSON", non_positive.to_string());
+        assert!(matches!(
+            support_admission_from_env(),
+            Err(ConfigError::InvalidValue(message)) if message.contains("positive")
+        ));
+
         let mut too_long = base;
         too_long["capabilities"][0]["expires_at"] = serde_json::json!(now + 24 * 60 * 60 + 1);
         std::env::set_var("BUZZ_SUPPORT_ADMISSION_JSON", too_long.to_string());
         assert!(matches!(
             support_admission_from_env(),
-            Err(ConfigError::InvalidValue(message)) if message.contains("next 24 hours")
+            Err(ConfigError::InvalidValue(message)) if message.contains("24 hours")
         ));
         std::env::remove_var("BUZZ_SUPPORT_ADMISSION_JSON");
     }

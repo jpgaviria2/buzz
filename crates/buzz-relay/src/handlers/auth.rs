@@ -167,6 +167,7 @@ fn ban_denial(outcome: BanOutcome) -> Option<(&'static str, &'static str, AuthOu
 }
 
 /// Why a bound socket is refused at the final admission check.
+#[derive(Debug)]
 pub(crate) struct AdmissionDenial {
     pub(crate) metric: &'static str,
     pub(crate) reason: &'static str,
@@ -189,6 +190,22 @@ pub(crate) fn ban_admission_denial(ban: BanOutcome) -> Option<AdmissionDenial> {
     })
 }
 
+/// The authority that survived the final writer-backed admission check.
+#[derive(Debug, Clone)]
+pub(crate) enum FinalAdmissionAuthority {
+    Ordinary,
+    Support(buzz_db::SupportGrant),
+}
+
+fn restrict_to_support_grant(auth_ctx: &mut buzz_auth::AuthContext, grant: &buzz_db::SupportGrant) {
+    auth_ctx.scopes = vec![
+        buzz_auth::Scope::MessagesRead,
+        buzz_auth::Scope::MessagesWrite,
+        buzz_auth::Scope::Unknown("support:dm".into()),
+    ];
+    auth_ctx.channel_ids = Some(vec![grant.channel_id]);
+}
+
 /// Final ban and relay-membership verdict for an authenticating socket.
 ///
 /// Callers bind the socket to `pubkey` first (the registry a ban's or
@@ -197,15 +214,18 @@ pub(crate) fn ban_admission_denial(ban: BanOutcome) -> Option<AdmissionDenial> {
 /// committed ban or removal is visible to these fresh reads. Checking before
 /// binding leaves a gap where both are missed. Callers must also refuse a
 /// socket whose cancellation token fired. Both reads fail closed.
-pub(crate) async fn final_admission_denial(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn final_admission_authority(
     state: &AppState,
-    community: buzz_core::CommunityId,
+    tenant: &buzz_core::TenantContext,
     pubkey: nostr::PublicKey,
     auth_tag_json: Option<&str>,
     signed_auth_created_at: Option<u64>,
     token_owner: Option<nostr::PublicKey>,
-    allow_support_grant: bool,
-) -> Option<AdmissionDenial> {
+    allow_support: bool,
+    support_required: bool,
+) -> Result<FinalAdmissionAuthority, AdmissionDenial> {
+    let community = tenant.community();
     let ban = community_ban_outcome(
         state,
         community,
@@ -217,7 +237,7 @@ pub(crate) async fn final_admission_denial(
     )
     .await;
     if let Some(denial) = ban_admission_denial(ban) {
-        return Some(denial);
+        return Err(denial);
     }
     match crate::api::relay_members::check_relay_membership_authoritative(
         state,
@@ -229,36 +249,42 @@ pub(crate) async fn final_admission_denial(
     )
     .await
     {
-        Ok(crate::api::relay_members::MembershipDecision::Denied) if allow_support_grant => {
-            match crate::api::support::active_grant(state, community, &pubkey).await {
-                Ok(Some(_)) => None,
-                Ok(None) => Some(AdmissionDenial {
-                    metric: "not_relay_member",
-                    reason: "restricted: not a relay member",
-                    outcome: AuthOutcome::NotRelayMember,
-                    class: buzz_auth::DenialClass::AuthorizationDenied,
-                }),
-                Err(e) => {
-                    warn!(pubkey = %pubkey.to_hex(), error = %e, "support grant recheck failed, denying (fail-closed)");
-                    Some(AdmissionDenial {
-                        metric: "support_grant_check_error",
-                        reason: "error: internal error checking support grant",
-                        outcome: AuthOutcome::RelayMembershipCheckError,
-                        class: buzz_auth::DenialClass::AuthorizationUnavailable,
-                    })
-                }
-            }
+        Ok(crate::api::relay_members::MembershipDecision::OpenRelay)
+        | Ok(crate::api::relay_members::MembershipDecision::Member)
+        | Ok(crate::api::relay_members::MembershipDecision::ViaOwner(_))
+            if !support_required =>
+        {
+            Ok(FinalAdmissionAuthority::Ordinary)
         }
-        Ok(crate::api::relay_members::MembershipDecision::Denied) => Some(AdmissionDenial {
-            metric: "not_relay_member",
-            reason: "restricted: not a relay member",
-            outcome: AuthOutcome::NotRelayMember,
-            class: buzz_auth::DenialClass::AuthorizationDenied,
-        }),
-        Ok(_) => None,
+        Ok(crate::api::relay_members::MembershipDecision::Denied) if !allow_support => {
+            Err(AdmissionDenial {
+                metric: "not_relay_member",
+                reason: "restricted: not a relay member",
+                outcome: AuthOutcome::NotRelayMember,
+                class: buzz_auth::DenialClass::AuthorizationDenied,
+            })
+        }
+        Ok(_) => match crate::api::support::active_grant(state, tenant, &pubkey).await {
+            Ok(Some(grant)) => Ok(FinalAdmissionAuthority::Support(grant)),
+            Ok(None) => Err(AdmissionDenial {
+                metric: "not_relay_member",
+                reason: "restricted: not a relay member",
+                outcome: AuthOutcome::NotRelayMember,
+                class: buzz_auth::DenialClass::AuthorizationDenied,
+            }),
+            Err(e) => {
+                warn!(pubkey = %pubkey.to_hex(), error = %e, "support grant recheck failed, denying (fail-closed)");
+                Err(AdmissionDenial {
+                    metric: "support_grant_check_error",
+                    reason: "error: internal error checking support grant",
+                    outcome: AuthOutcome::RelayMembershipCheckError,
+                    class: buzz_auth::DenialClass::AuthorizationUnavailable,
+                })
+            }
+        },
         Err(e) => {
             warn!(pubkey = %pubkey.to_hex(), error = %e, "relay membership recheck failed, denying (fail-closed)");
-            Some(AdmissionDenial {
+            Err(AdmissionDenial {
                 metric: "relay_membership_check_error",
                 reason: "error: internal error checking relay membership",
                 outcome: AuthOutcome::RelayMembershipCheckError,
@@ -556,7 +582,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
 
             let support_grant =
-                crate::api::support::active_grant(&state, conn.tenant.community(), &pubkey).await;
+                crate::api::support::active_grant(&state, &conn.tenant, &pubkey).await;
 
             let mut support_is_admission_authority = false;
             // Pubkey allowlist gate — only for pubkey-only auth. A support grant
@@ -640,14 +666,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             let nip_oa_owner = match classify_relay_membership(membership) {
                 PolicyCheck::Allowed(owner) => owner,
                 PolicyCheck::Denied => {
-                    if let Ok(Some(grant)) = support_grant {
+                    if support_grant.is_ok_and(|grant| grant.is_some()) {
                         support_is_admission_authority = true;
-                        auth_ctx.scopes = vec![
-                            buzz_auth::Scope::MessagesRead,
-                            buzz_auth::Scope::MessagesWrite,
-                            buzz_auth::Scope::Unknown("support:dm".into()),
-                        ];
-                        auth_ctx.channel_ids = Some(vec![grant.channel_id]);
                         None
                     } else {
                         warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "not a relay member");
@@ -688,40 +708,6 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     return;
                 }
             };
-
-            if support_is_admission_authority {
-                let grant = match crate::api::support::active_grant(
-                    &state,
-                    conn.tenant.community(),
-                    &pubkey,
-                )
-                .await
-                {
-                    Ok(Some(grant)) => grant,
-                    _ => {
-                        conn.send(RelayMessage::ok(
-                            &event_id_hex,
-                            false,
-                            "restricted: support grant expired or revoked",
-                        ));
-                        return;
-                    }
-                };
-                auth_ctx.scopes = vec![
-                    buzz_auth::Scope::MessagesRead,
-                    buzz_auth::Scope::MessagesWrite,
-                    buzz_auth::Scope::Unknown("support:dm".into()),
-                ];
-                auth_ctx.channel_ids = Some(vec![grant.channel_id]);
-                let cancel = conn.cancel.clone();
-                tokio::spawn(async move {
-                    let wait = (grant.expires_at - chrono::Utc::now())
-                        .to_std()
-                        .unwrap_or_default();
-                    tokio::time::sleep(wait).await;
-                    cancel.cancel();
-                });
-            }
 
             // Open relay NIP-OA backfill: extract owner for agent→owner DB mapping
             // (needed for observer frame auth). Only runs on open relays — on closed
@@ -800,7 +786,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             }
 
             // Bind, then take the final ban/membership decision (see
-            // `final_admission_denial`), then refuse if a disconnect already
+            // `final_admission_authority`), then refuse if a disconnect already
             // cancelled this socket. No await separates the last check from
             // `authenticate`.
             // A proven owner is recorded before the pubkey, so this socket's
@@ -832,35 +818,52 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     return;
                 }
             }
-            let denial = match final_admission_denial(
+            let authority = match final_admission_authority(
                 &state,
-                conn.tenant.community(),
+                &conn.tenant,
                 pubkey,
                 auth_tag_json.as_deref(),
                 Some(signed_auth_created_at),
                 token_owner,
                 true,
+                support_is_admission_authority,
             )
             .await
             {
-                None if conn.cancel.is_cancelled() => Some(AdmissionDenial {
+                Ok(_) if conn.cancel.is_cancelled() => Err(AdmissionDenial {
                     metric: "revoked_during_auth",
                     reason: "blocked: access revoked",
                     outcome: AuthOutcome::Banned,
                     class: buzz_auth::DenialClass::AuthorizationDenied,
                 }),
-                denial => denial,
+                result => result,
             };
-            if let Some(denial) = denial {
-                warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), reason = denial.reason, "denied at final admission check");
-                deny_admission(&conn, &event_id_hex, denial);
-                return;
+            let authority = match authority {
+                Ok(authority) => authority,
+                Err(denial) => {
+                    warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), reason = denial.reason, "denied at final admission check");
+                    deny_admission(&conn, &event_id_hex, denial);
+                    return;
+                }
+            };
+            let support_only = matches!(&authority, FinalAdmissionAuthority::Support(_));
+            if let FinalAdmissionAuthority::Support(grant) = authority {
+                restrict_to_support_grant(&mut auth_ctx, &grant);
+                let cancel = conn.cancel.clone();
+                tokio::spawn(async move {
+                    let wait = (grant.expires_at - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    tokio::time::sleep(wait).await;
+                    cancel.cancel();
+                });
             }
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
             if !conn.authenticate(auth_ctx) {
                 return;
             }
+            state.conn_manager.set_support_only(conn_id, support_only);
             // The permit is held through the deny-set check and the OK send so
             // the auth commit is atomic with respect to expiry.
             //
@@ -930,7 +933,8 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 mod tests {
     use super::{
         ban_denial, classify_allowlist, classify_relay_membership, extract_auth_tag_json,
-        handle_auth, nip42_denial_class, BanOutcome, PolicyCheck,
+        final_admission_authority, handle_auth, nip42_denial_class, restrict_to_support_grant,
+        BanOutcome, FinalAdmissionAuthority, PolicyCheck,
     };
     use crate::api::relay_members::MembershipDecision;
     use crate::connection::{tests::test_conn_with_auth, AuthState};
@@ -975,6 +979,29 @@ mod tests {
             challenge: challenge.to_owned(),
             started_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn final_support_authority_rewrites_an_unrestricted_context() {
+        let customer = Keys::generate();
+        let grant = buzz_db::SupportGrant {
+            subject_pubkey: customer.public_key().to_bytes().to_vec(),
+            channel_id: uuid::Uuid::new_v4(),
+            support_pubkey: Keys::generate().public_key().to_bytes().to_vec(),
+            escalation_pubkey: Keys::generate().public_key().to_bytes().to_vec(),
+            capability_generation: "g1".into(),
+            expires_at: chrono::Utc::now() + chrono::TimeDelta::days(30),
+        };
+        let mut context = buzz_auth::AuthContext {
+            pubkey: customer.public_key(),
+            scopes: Vec::new(),
+            channel_ids: None,
+            auth_method: buzz_auth::AuthMethod::Nip42,
+            agent_owner_pubkey: None,
+        };
+        restrict_to_support_grant(&mut context, &grant);
+        assert!(crate::api::support::is_support_only_context(&context));
+        assert_eq!(context.channel_ids, Some(vec![grant.channel_id]));
     }
 
     /// Build a signed NIP-98 (kind 27235) event carrying the given tags. The
@@ -2041,12 +2068,125 @@ mod tests {
             builder.sign_with_keys(keys).unwrap()
         }
 
+        /// A caller that passed the ordinary membership read but loses that
+        /// membership before the final writer-backed check must be admitted only
+        /// under its support grant, never with the unrestricted context built by
+        /// the earlier path.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn membership_removed_before_final_check_falls_back_to_scoped_support_authority() {
+            use std::sync::Arc;
+
+            let base = auth_test_state_real_db_expect().await;
+            let community = seeded_community(&base).await;
+            let customer = Keys::generate();
+            let support = Keys::generate();
+            let escalation = Keys::generate();
+            let customer_pubkey = customer.public_key();
+            let support_pubkey = support.public_key();
+            let escalation_pubkey = escalation.public_key();
+            let participants: [&[u8]; 3] = [
+                customer_pubkey.as_bytes(),
+                support_pubkey.as_bytes(),
+                escalation_pubkey.as_bytes(),
+            ];
+            let channel = buzz_db::dm::create_dm(
+                base.db.pool(),
+                community,
+                &participants,
+                support.public_key().as_bytes(),
+            )
+            .await
+            .expect("support dm");
+            base.db
+                .admit_support(
+                    community,
+                    customer.public_key().as_bytes(),
+                    channel.id,
+                    support.public_key().as_bytes(),
+                    escalation.public_key().as_bytes(),
+                    "g1",
+                    chrono::Utc::now() + chrono::TimeDelta::days(30),
+                )
+                .await
+                .expect("support grant");
+            let _ = buzz_db::relay_members::add_relay_member(
+                base.db.pool(),
+                community,
+                &customer.public_key().to_hex(),
+                "member",
+                None,
+                &Keys::generate(),
+            )
+            .await
+            .expect("seed member");
+            assert!(base
+                .db
+                .is_relay_member(community, &customer.public_key().to_hex())
+                .await
+                .expect("initial membership"));
+
+            let mut config = (*base.config).clone();
+            config.require_relay_membership = true;
+            config.support_admission = Some(crate::config::SupportAdmissionConfig {
+                community_host: "buzz.anmore.space".into(),
+                support_pubkey: support.public_key(),
+                escalation_pubkey: escalation.public_key(),
+                grant_ttl_secs: 30 * 24 * 60 * 60,
+                capabilities: vec![crate::config::SupportCapabilityConfig {
+                    generation: "g1".into(),
+                    capability_hash: [7; 32],
+                    expires_at: chrono::Utc::now().timestamp() - 1,
+                    revoked: false,
+                }],
+            });
+            let mut state = (*base).clone();
+            state.config = Arc::new(config);
+            let state = Arc::new(state);
+            let _ = state
+                .db
+                .remove_relay_member(
+                    community,
+                    &customer.public_key().to_hex(),
+                    &Keys::generate(),
+                )
+                .await
+                .expect("remove member");
+
+            let tenant = buzz_core::TenantContext::resolved(community, "buzz.anmore.space");
+            let authority = final_admission_authority(
+                &state,
+                &tenant,
+                customer.public_key(),
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
+            .await
+            .expect("support fallback");
+            let FinalAdmissionAuthority::Support(grant) = authority else {
+                panic!("final authority must be support after membership removal");
+            };
+            let mut context = buzz_auth::AuthContext {
+                pubkey: customer.public_key(),
+                scopes: Vec::new(),
+                channel_ids: None,
+                auth_method: buzz_auth::AuthMethod::Nip42,
+                agent_owner_pubkey: None,
+            };
+            restrict_to_support_grant(&mut context, &grant);
+            assert!(crate::api::support::is_support_only_context(&context));
+            assert_eq!(context.channel_ids, Some(vec![channel.id]));
+        }
+
         /// A ban whose disconnect lands after AUTH's policy reads but before it
         /// binds the socket must still refuse admission: the final check runs
         /// after the bind. A user in another community, paused at the same
         /// point, is still admitted.
         ///
-        /// Mutation: remove the `final_admission_denial` call from
+        /// Mutation: remove the `final_admission_authority` call from
         /// `handle_auth` → the banned socket is admitted → RED.
         #[tokio::test]
         #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
@@ -2143,7 +2283,7 @@ mod tests {
         /// member: the final check reads membership from the writer. A user
         /// in another community, paused at the same point, is still admitted.
         ///
-        /// Mutation: make `final_admission_denial` call the replica-routed
+        /// Mutation: make `final_admission_authority` call the replica-routed
         /// `check_relay_membership` → the removed socket is admitted → RED.
         #[tokio::test]
         #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]

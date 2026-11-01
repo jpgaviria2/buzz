@@ -997,7 +997,7 @@ async fn run_active_audio_connection(
     }
 
     // Bind, then take the final ban/membership decision the root socket
-    // applies (see `final_admission_denial`), before any huddle lease. A ban
+    // applies (see `final_admission_authority`), before any huddle lease. A ban
     // or removal whose disconnect ran before the bind is seen by these fresh
     // reads; one that runs after it cancels this socket (`check_cancel!`).
     // Same order as root AUTH: a proven owner before the pubkey; otherwise
@@ -1015,18 +1015,18 @@ async fn run_active_audio_connection(
     }
     let denial = match owner {
         Err(denial) => Some(denial),
-        Ok(_) => {
-            crate::handlers::auth::final_admission_denial(
-                &state,
-                tenant.community(),
-                pubkey,
-                auth_tag_json.as_deref(),
-                Some(signed_auth_created_at),
-                token_owner,
-                false,
-            )
-            .await
-        }
+        Ok(_) => crate::handlers::auth::final_admission_authority(
+            &state,
+            &tenant,
+            pubkey,
+            auth_tag_json.as_deref(),
+            Some(signed_auth_created_at),
+            token_owner,
+            false,
+            false,
+        )
+        .await
+        .err(),
     };
     if let Some(denial) = denial {
         shadow_attempt.refused();

@@ -26,10 +26,12 @@ Set `BUZZ_SUPPORT_ADMISSION_JSON` to strict JSON:
 
 The support plane is accepted only on the exact canonical host
 `buzz.anmore.space`; aliases and other tenant hosts return not found. One to
-eight generations may be configured. Active capabilities must expire in the
-next 24 hours, and both generation identifiers and capability hashes must be
-unique. To rotate, deploy the new generation
-alongside the old one, update clients, then set the old generation's `revoked`
+eight generations may be configured. Every `expires_at` must be a positive Unix
+second no more than 24 hours in the future when loaded. Expired generations are
+kept in configuration so already-issued grants survive relay restarts; they remain
+ineligible for new admissions because capability matching rejects expiry. Both
+generation identifiers and capability hashes must be unique. To rotate, deploy the
+new generation alongside the old one, update clients, then set the old generation's `revoked`
 field to `true` (or remove it) and reload the relay configuration. Raw capability
 values are SHA-256 hashed while configuration is loaded and are not logged.
 Customer grants retain their independent configured expiry (30 days by default),
@@ -82,10 +84,12 @@ Reads are limited to kind 9 in the exact DM and kind 0 profiles for the exact
 three participants. Writes must be customer-authored kind 9 events with exactly
 one two-element `h` tag for the granted channel. They may have no `p` tag or one
 exact two-element `p` tag for the escalation pubkey. Grant expiry, revocation,
-generation status, and the exact active three-person DM roster are rechecked on
-NIP-42 admission, REQ, and EVENT. Support sockets are cancelled at the grant
-deadline, so live subscriptions cannot continue after expiry. Support sessions
-accept only REQ and EVENT frames; COUNT, artifact sync, AUTH, and CLOSE are
+generation status, canonical host, and the exact active three-person DM roster are
+rechecked on NIP-42 admission, REQ, EVENT, and live event delivery. Support sockets
+are cancelled at the grant deadline, so live subscriptions cannot continue after
+expiry; delivery-time checks also stop stale subscriptions after revocation,
+generation removal/revocation, participant rotation, or host aliasing. Support
+sessions accept only REQ and EVENT frames; COUNT, artifact sync, AUTH, and CLOSE are
 refused after support authentication.
 
 To revoke one customer grant, call the database-layer

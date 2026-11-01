@@ -142,10 +142,6 @@ async fn check_fanout_access(
     matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
     threaded: Option<&crate::state::ThreadedChannelVisibility>,
 ) -> FanoutAccess {
-    let verified = |allowed| FanoutAccess {
-        allowed,
-        unverified: Vec::new(),
-    };
     // First enforce the receiver-side tenant label. Subscription indexes are
     // community-scoped, but stale/injected matches and future fan-out helpers
     // must still fail closed at the send chokepoint: a connection bound to
@@ -156,6 +152,50 @@ async fn check_fanout_access(
             state.conn_manager.community_for_conn(*conn_id) == Some(community_id)
         })
         .collect();
+
+    // Support-only subscriptions are leases, not durable authorization. Re-read
+    // the writer-backed grant and current config at delivery time so customer
+    // revocation, generation removal/revocation, participant rotation, or an
+    // alias-host connection stops receiving immediately even if its registered
+    // subscription and DM membership are still present.
+    let mut support_checked = Vec::with_capacity(matches.len());
+    let mut support_unverified = Vec::new();
+    for (conn_id, sub_id) in matches {
+        if !state.conn_manager.is_support_only_conn(conn_id) {
+            support_checked.push((conn_id, sub_id));
+            continue;
+        }
+        let Some((bound_community, host, pubkey)) =
+            state.conn_manager.support_delivery_identity(conn_id)
+        else {
+            continue;
+        };
+        if bound_community != community_id {
+            continue;
+        }
+        match crate::api::support::active_grant_for_delivery(state, community_id, &host, &pubkey)
+            .await
+        {
+            Ok(grant)
+                if crate::api::support::support_delivery_authorized(
+                    grant.as_ref(),
+                    stored_event.channel_id,
+                ) =>
+            {
+                support_checked.push((conn_id, sub_id));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, %conn_id, "fan-out support authorization recheck failed");
+                support_unverified.push((conn_id, sub_id));
+            }
+        }
+    }
+    let matches = support_checked;
+    let verified = |allowed| FanoutAccess {
+        allowed,
+        unverified: support_unverified.clone(),
+    };
 
     // Author-only kinds (NIP-ER reminders) may only ever be delivered to the
     // event's own author. This gate lives here — the chokepoint shared by the
@@ -250,15 +290,17 @@ async fn check_fanout_access(
             // Fail closed: if we cannot determine visibility, do not leak a
             // possibly-private channel's events.
             warn!(%channel_id, "fan-out access filter: visibility lookup failed: {e}");
+            let mut unverified = support_unverified.clone();
+            unverified.extend(matches);
             return FanoutAccess {
                 allowed: Vec::new(),
-                unverified: matches,
+                unverified,
             };
         }
     }
 
     let mut allowed = Vec::with_capacity(matches.len());
-    let mut unverified = Vec::new();
+    let mut unverified = support_unverified;
     for (conn_id, sub_id) in matches {
         let Some(pubkey) = state.conn_manager.pubkey_for_conn(conn_id) else {
             continue;
@@ -717,9 +759,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
 
     if support_only {
         let grant =
-            match crate::api::support::active_grant(&state, conn.tenant.community(), &auth_pubkey)
-                .await
-            {
+            match crate::api::support::active_grant(&state, &conn.tenant, &auth_pubkey).await {
                 Ok(Some(grant)) => grant,
                 Ok(None) => {
                     reject("restricted");
@@ -3172,11 +3212,80 @@ mod tests {
             conn_id
         }
 
+        fn register_support_conn(
+            state: &AppState,
+            community: buzz_core::CommunityId,
+            host: &str,
+            pubkey: Vec<u8>,
+        ) -> Uuid {
+            let conn_id = Uuid::new_v4();
+            let (tx, _rx) = mpsc::channel(1);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+            state.conn_manager.register_with_host(
+                conn_id,
+                tx,
+                ctrl_tx,
+                tokio::sync::mpsc::channel(1).0,
+                None,
+                CancellationToken::new(),
+                community,
+                host.to_owned(),
+                Arc::new(AtomicU8::new(0)),
+                Arc::new(Mutex::new(HashMap::new())),
+                3,
+                crate::state::CommunityConnectionControl::new(
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+            );
+            state.conn_manager.set_authenticated_pubkey(conn_id, pubkey);
+            state.conn_manager.set_support_only(conn_id, true);
+            conn_id
+        }
+
         fn channel_event(channel_id: Option<Uuid>) -> StoredEvent {
             let event = EventBuilder::new(Kind::Custom(9), "{}")
                 .sign_with_keys(&Keys::generate())
                 .expect("sign event");
             StoredEvent::new(event, channel_id)
+        }
+
+        #[tokio::test]
+        async fn support_delivery_rejects_an_alias_host_before_fanout() {
+            let base = test_state().await;
+            let support = Keys::generate();
+            let escalation = Keys::generate();
+            let mut config = (*base.config).clone();
+            config.support_admission = Some(crate::config::SupportAdmissionConfig {
+                community_host: "buzz.anmore.space".into(),
+                support_pubkey: support.public_key(),
+                escalation_pubkey: escalation.public_key(),
+                grant_ttl_secs: 30 * 24 * 60 * 60,
+                capabilities: vec![crate::config::SupportCapabilityConfig {
+                    generation: "g1".into(),
+                    capability_hash: [1; 32],
+                    expires_at: chrono::Utc::now().timestamp() - 1,
+                    revoked: false,
+                }],
+            });
+            let mut raw = (*base).clone();
+            raw.config = Arc::new(config);
+            let state = Arc::new(raw);
+            let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+            let conn = register_support_conn(
+                &state,
+                community,
+                "alias.anmore.space",
+                Keys::generate().public_key().to_bytes().to_vec(),
+            );
+            let out = filter_fanout_by_access(
+                &state,
+                community,
+                &channel_event(None),
+                vec![(conn, "s".to_string())],
+                None,
+            )
+            .await;
+            assert!(out.is_empty());
         }
 
         #[tokio::test]

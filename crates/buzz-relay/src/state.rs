@@ -333,6 +333,8 @@ struct ConnEntry {
     /// Community resolved from the connection host at handshake. This is the
     /// receiver-side tenant label fan-out must compare against the event label.
     community_id: CommunityId,
+    /// Exact normalized host that resolved the connection's tenant.
+    host: String,
     /// Shared with `ConnectionState` — both direct sends and fan-out
     /// broadcasts track the same consecutive-full counter.
     backpressure_count: Arc<AtomicU8>,
@@ -348,6 +350,8 @@ struct ConnEntry {
     /// Set once AUTH succeeds. The pubkey is bound earlier so revocation can
     /// find a socket mid-admission; online counts and presence read this.
     admitted: AtomicBool,
+    /// Whether final AUTH authority was the support-only grant plane.
+    support_only: AtomicBool,
     grace_limit: u8,
     /// Lifecycle control used by `disconnect_nip_fi` for the denial transition.
     community_control: CommunityConnectionControl,
@@ -713,6 +717,7 @@ impl ConnectionManager {
     /// subscription map, and grace limit.
     // Each argument is a distinct per-connection attribute stored verbatim in
     // `ConnEntry`; a params struct would only relocate the same fields.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register(
         &self,
@@ -723,6 +728,38 @@ impl ConnectionManager {
         restart_tx: Option<mpsc::Sender<RestartClose>>,
         cancel: CancellationToken,
         community_id: CommunityId,
+        backpressure_count: Arc<AtomicU8>,
+        subscriptions: ConnectionSubscriptions,
+        grace_limit: u8,
+        community_control: CommunityConnectionControl,
+    ) {
+        self.register_with_host(
+            conn_id,
+            tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            restart_tx,
+            cancel,
+            community_id,
+            "test.invalid".to_owned(),
+            backpressure_count,
+            subscriptions,
+            grace_limit,
+            community_control,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_with_host(
+        &self,
+        conn_id: Uuid,
+        tx: mpsc::Sender<WsMessage>,
+        ctrl_tx: mpsc::Sender<WsMessage>,
+        terminal_ctrl_tx: mpsc::Sender<WsMessage>,
+        restart_tx: Option<mpsc::Sender<RestartClose>>,
+        cancel: CancellationToken,
+        community_id: CommunityId,
+        host: String,
         backpressure_count: Arc<AtomicU8>,
         subscriptions: ConnectionSubscriptions,
         grace_limit: u8,
@@ -739,12 +776,14 @@ impl ConnectionManager {
                 restart_tx,
                 cancel,
                 community_id,
+                host,
                 backpressure_count,
                 subscriptions,
                 authenticated_pubkey: Arc::new(std::sync::RwLock::new(None)),
                 nip_fi: std::sync::RwLock::new(None),
                 admitted_owner: std::sync::OnceLock::new(),
                 admitted: AtomicBool::new(false),
+                support_only: AtomicBool::new(false),
                 grace_limit,
                 community_control,
             },
@@ -806,6 +845,33 @@ impl ConnectionManager {
         if let Some(entry) = self.connections.get(&conn_id) {
             entry.admitted.store(true, Ordering::Release);
         }
+    }
+
+    /// Record whether final AUTH authority was the support-only grant plane.
+    pub fn set_support_only(&self, conn_id: Uuid, support_only: bool) {
+        if let Some(entry) = self.connections.get(&conn_id) {
+            entry.support_only.store(support_only, Ordering::Release);
+        }
+    }
+
+    /// Whether final AUTH authority for this connection was support-only.
+    pub fn is_support_only_conn(&self, conn_id: Uuid) -> bool {
+        self.connections
+            .get(&conn_id)
+            .is_some_and(|entry| entry.support_only.load(Ordering::Acquire))
+    }
+
+    /// Return the identity needed to revalidate a support-only live delivery.
+    pub fn support_delivery_identity(
+        &self,
+        conn_id: Uuid,
+    ) -> Option<(CommunityId, String, Vec<u8>)> {
+        let entry = self.connections.get(&conn_id)?;
+        if !entry.support_only.load(Ordering::Acquire) {
+            return None;
+        }
+        let pubkey = entry.authenticated_pubkey.read().ok()?.clone()?;
+        Some((entry.community_id, entry.host.clone(), pubkey))
     }
 
     /// Whether `pubkey_bytes` has an admitted connection in one community on

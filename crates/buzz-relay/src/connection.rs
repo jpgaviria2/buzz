@@ -630,7 +630,7 @@ async fn handle_active_connection(
     let mut auth_lifecycle = AuthLifecycleGuard::new(Arc::clone(&conn));
 
     // Register after challenge succeeds — avoids leaked entries on early disconnect.
-    state.conn_manager.register(
+    state.conn_manager.register_with_host(
         conn_id,
         tx.clone(),
         ctrl_tx.clone(),
@@ -638,6 +638,7 @@ async fn handle_active_connection(
         Some(restart_tx),
         cancel.clone(),
         conn.tenant.community(),
+        conn.tenant.host().to_owned(),
         Arc::clone(&backpressure_count),
         subscriptions,
         state.config.slow_client_grace_limit,
